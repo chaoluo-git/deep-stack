@@ -232,10 +232,18 @@ def responsive_profile(profile: LayoutProfile, viewport: tuple[int, int, int, in
         # Keep the card and text crops proportional to table height. Relocate
         # their seat group instead of compressing them into the smaller width.
         x = (anchor + bounds["x"] * _REFERENCE_RATIO - reference_anchor) / ratio
-        right = min(1.0, x + bounds["width"] * _REFERENCE_RATIO / ratio)
+        region_width = bounds["width"] * _REFERENCE_RATIO / ratio
+        region = bounds
+        if key in HERO_CARD_FIELDS:
+            # The split-screen cards are slightly narrower and spaced farther apart.
+            narrow_pixels = (1 - wide_share) / _REFERENCE_HEIGHT
+            x += (2 if key == HERO_CARD_FIELDS[0] else 6) * narrow_pixels / ratio
+            region_width -= 3 * narrow_pixels / ratio
+            region = {**bounds, "y": bounds["y"] + narrow_pixels, "height": bounds["height"] - 3 * narrow_pixels}
+        right = min(1.0, x + region_width)
         x = max(0.0, x)
         if right > x:
-            regions[key] = {**bounds, "x": x, "width": right - x}
+            regions[key] = {**region, "x": x, "width": right - x}
     return LayoutProfile(regions, ratio)
 
 

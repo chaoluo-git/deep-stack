@@ -168,6 +168,51 @@ def _suit_masks():
     return {suit: np.stack(variants) for suit, variants in masks.items()}
 
 
+def _suit_overlap(mask, variants):
+    overlap = 2 * (mask & variants).sum(axis=(1, 2)) / (mask.sum() + variants.sum(axis=(1, 2)))
+    return float(overlap.max())
+
+
+def _match_large_suit(image):
+    """Require the matching colored rank ink and a large lower-right pip."""
+    import cv2
+    import numpy as np
+
+    color = np.asarray(image, dtype=np.int16)
+    red, green, blue = color.transpose(2, 0, 1)
+    width, height = image.size
+    inks = {
+        "s": (color.max(axis=2) <= 105) & (np.ptp(color, axis=2) <= 26),
+        "h": (red >= green + 40) & (red >= blue + 29),
+        "c": (green >= red + 31) & (green >= blue + 18),
+        "d": (blue >= red + 31) & (blue >= green + 20),
+    }
+    rank_box = np.s_[floor(height * 0.03):ceil(height * 0.46), :ceil(width * 0.51)]
+    rank_ink = {suit: int(ink[rank_box].sum()) for suit, ink in inks.items()}
+    suit = max(rank_ink, key=rank_ink.get)
+    next_color = max(count for other, count in rank_ink.items() if other != suit)
+    if rank_ink[suit] < max(12, width * height * 0.004) or rank_ink[suit] < 2 * next_color:
+        return None
+
+    pip = inks[suit][floor(height * 0.44):ceil(height * 0.98), floor(width * 0.21):ceil(width * 0.98)]
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(pip.astype(np.uint8), connectivity=8)
+    if count <= 1:
+        return None
+    index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    _, _, pip_width, pip_height, area = stats[index]
+    if pip_width < width * 0.31 or pip_height < height * 0.22 or area < width * height * 0.048:
+        return None
+    mask = _ink_mask(labels == index)
+    if mask is None:
+        return None
+    references = _suit_masks()
+    expected = _suit_overlap(mask, references[suit])
+    other = max(_suit_overlap(mask, variants) for key, variants in references.items() if key != suit)
+    if expected < 0.84 or other > expected + 0.02:
+        return None
+    return suit, expected
+
+
 def _match_suit(image):
     import cv2
     import numpy as np
@@ -213,8 +258,7 @@ def _match_suit(image):
             scores = []
             for suit in options:
                 variants = references[suit]
-                overlap = 2 * (mask & variants).sum(axis=(1, 2)) / (mask.sum() + variants.sum(axis=(1, 2)))
-                scores.append((float(overlap.max()), suit))
+                scores.append((_suit_overlap(mask, variants), suit))
             scores.sort(reverse=True)
             (overlap, suit), (second, _) = scores
             if overlap >= minimum and overlap - second >= margin:
@@ -249,25 +293,35 @@ def _ocr(image, *, detect=False):
     return lines
 
 
+def _read_corner(image, match, rank_height):
+    from .recognition import _card
+
+    width, height = image.size
+    rank_image = image.crop((floor(width * 0.015), floor(height * 0.015),
+                             ceil(width * 0.56), ceil(height * rank_height)))
+    suit, overlap = match
+    corner = {"suit": suit, "overlap": overlap, "rank_observations": _ocr(rank_image)}
+    return corner if _card({"card": {"corner_card": corner}}, "card") is not None else None
+
+
 def _card_fields(image):
     surface = _surface(image)
     result = {"observations": [], "empty_felt": surface == "felt", "card_surface": surface == "card"}
     if surface == "felt" or min(image.size) < 12 or _appears_blank(image):
         return result
 
-    width, height = image.size
     if surface == "card":
+        width, height = image.size
         suit_image = image.crop((0, floor(height * 0.28),
                                  ceil(width * 0.48), ceil(height * 0.66)))
         matched = _match_suit(suit_image)
-        if matched is not None:
-            suit, overlap = matched
-            rank_image = image.crop((floor(width * 0.015), floor(height * 0.015),
-                                     ceil(width * 0.56), ceil(height * 0.33)))
-            rank = _ocr(rank_image)
-            if rank:
-                result["corner_card"] = {"suit": suit, "overlap": overlap, "rank_observations": rank}
-                return result
+        if matched is not None and (corner := _read_corner(image, matched, 0.33)) is not None:
+            result["corner_card"] = corner
+            return result
+        large = _match_large_suit(image)
+        if large is not None and (corner := _read_corner(image, large, 0.46)) is not None:
+            result["corner_card"] = {**corner, "mode": "large_pip"}
+            return result
     result["observations"] = _ocr(image, detect=True)
     return result
 

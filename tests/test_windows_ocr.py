@@ -6,7 +6,9 @@ import unittest
 from unittest.mock import patch
 
 from deep_stack.layout import default_profile, pixel_regions
-from deep_stack.windows_ocr import WindowsOCRError, _generic_suit, _match_suit, read_fields
+from deep_stack.windows_ocr import (
+    WindowsOCRError, _card_fields, _generic_suit, _match_large_suit, _match_suit, read_fields,
+)
 
 
 _HAS_OCR = all(find_spec(name) is not None for name in ("rapidocr", "onnxruntime", "PIL"))
@@ -111,6 +113,45 @@ class PortableOCRTests(unittest.TestCase):
                 cards = {key: value for key, value in fields.items() if "_card_" in key}
                 self.assertEqual(table["hero_cards"], ["As", "Kh"], cards)
                 self.assertEqual(table["board"], ["7d", "2c", "Qc"], cards)
+
+    def test_reads_four_colors_of_a_large_pip_deck(self):
+        from deep_stack.recognition import _card
+
+        for rank, suit, color, expected in (
+            ("A", "s", "#181818", "As"), ("10", "h", "#e52c41", "Th"),
+            ("K", "c", "#119854", "Kc"), ("6", "d", "#266de6", "6d"),
+        ):
+            with self.subTest(suit=suit):
+                fields = _card_fields(self._large_pip(rank, suit, color))
+                self.assertEqual(fields.get("corner_card", {}).get("mode"), "large_pip", fields)
+                self.assertEqual(_card({"card": fields}, "card"), expected, fields)
+
+    def test_confirmed_small_corner_pip_takes_priority(self):
+        from deep_stack.recognition import _card
+
+        image = self._large_pip("A", "s", "#181818")
+        with (
+            patch("deep_stack.windows_ocr._match_suit", return_value=("c", 0.96)),
+            patch("deep_stack.windows_ocr._ocr", return_value=[{"text": "A", "confidence": 0.99}]),
+            patch("deep_stack.windows_ocr._match_large_suit",
+                  side_effect=AssertionError("a valid corner pip already identified the suit")),
+        ):
+            fields = _card_fields(image)
+        self.assertEqual(_card({"card": fields}, "card"), "Ac")
+
+    def test_large_pip_requires_the_rank_color_and_symbol_shape_to_agree(self):
+        self.assertIsNone(_match_large_suit(self._large_pip("K", "d", "#119854")))
+        self.assertIsNone(_match_large_suit(self._large_pip("K", "c", "#119854", rank_color="#181818")))
+
+    @staticmethod
+    def _large_pip(rank, suit, color, *, rank_color=None):
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGB", (78, 114), "#fbfbfb")
+        font = _standard_font(35)
+        ImageDraw.Draw(image).text((21, 27), rank, font=font, fill=rank_color or color, anchor="mm")
+        image.paste(color, (22, 51), _generic_suit(suit, (54, 58)))
+        return image
 
     def test_dimmed_red_diamond_is_not_counted_as_black_ink(self):
         from PIL import Image

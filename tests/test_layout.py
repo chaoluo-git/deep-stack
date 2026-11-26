@@ -50,6 +50,12 @@ class LayoutTests(unittest.TestCase):
         self.assertGreaterEqual(width, 78)
         self.assertGreaterEqual(height, 113)
 
+        for key, edge in (("hero_card_0", 675), ("hero_card_1", 761)):
+            with self.subTest(key=key):
+                x, _, width, _ = boxes[key]
+                self.assertAlmostEqual(x, edge, delta=1)
+                self.assertAlmostEqual(width, 76, delta=1)
+
         mid_view = (0, 242, 2271, 1476)
         mid = pixel_regions(responsive_profile(profile, mid_view), mid_view)
         x, _, width, _ = mid["left_middle.avatar"]

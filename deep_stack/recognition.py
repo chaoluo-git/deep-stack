@@ -94,8 +94,6 @@ def live_profile():
         add(f"{seat}.stack", 1440, stack_y - 16, 144, 32, "number")
         back_x = 1533 if seat == "top_center" else 1456
         add(f"{seat}.cardback", back_x, avatar_y + 9, 43, 41, "marker")
-    for index, key in enumerate(_HERO_FIELDS):
-        add(key, 1432 + 86 * index, 1472, 75, 112, "card")
     add("bottom_center.wager", 1595, 1337, 74, 40, "number")
     add("top_center.wager", 1495, 517, 84, 40, "number")
     add("top_right.wager", 1604, 515, 74, 40, "number")
