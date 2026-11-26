@@ -74,6 +74,47 @@ class PlayerStoreTests(unittest.TestCase):
         self.assertEqual(self.store.record_frame("A", "hand2", incoming_action)["added"], 0)
         self.assertEqual(self.store.stats("123")["action_count"], 0)
 
+    def test_reconcile_accepts_explicit_vacancy_and_visual_change_without_a_hand(self):
+        self.store.bind("A", "right_upper", "1")
+        self.store.bind("A", "left_upper", "2")
+        self.assertEqual(self.store.reconcile_seats("A", frame(street=None)), [])
+        initial = frame(street=None)
+        initial["vacant_seats"] = ["right_upper"]
+        self.assertEqual(self.store.reconcile_seats("A", initial, changed_seats=["left_upper"]),
+                         ["left_upper", "right_upper"])
+        self.assertEqual(self.store.reconcile_seats("A", initial, changed_seats=["left_upper"]), [])
+        self.assertTrue(all(item["paused"] for item in self.store.bindings("A")))
+
+    def test_weak_ocr_conflict_does_not_pause_or_attribute_the_action(self):
+        self.store.bind("A", "right_upper", "1", name="原昵称")
+        conflicting = frame(reading(name="不同", action="bet", wager=15), street=None)
+        observation = {"text": "不同", "confidence": 0.7}
+        conflicting["evidence"] = {"right_upper.label": {"observations": [observation]}}
+        self.assertEqual(self.store.reconcile_seats("A", conflicting), [])
+        self.assertEqual(self.store.record_frame("A", "hand", conflicting)["added"], 0)
+        self.assertFalse(self.store.bindings("A")[0]["paused"])
+
+        observation["confidence"] = 0.95
+        self.assertEqual(self.store.reconcile_seats("A", conflicting), ["right_upper"])
+        self.assertTrue(self.store.bindings("A")[0]["paused"])
+
+    def test_confirmed_id_moves_from_paused_seat_and_keeps_old_actions(self):
+        self.store.bind("A", "right_upper", "123", name="玩家")
+        old_hand = frame(reading(name="玩家", action="check"))
+        self.store.record_frame("A", "old", old_hand)
+        old_seat = frame(street=None)
+        old_seat["vacant_seats"] = ["right_upper"]
+        self.store.reconcile_seats("A", old_seat)
+        self.store.bind("A", "left_upper", "123", name="玩家")
+        new_hand = frame(reading("left_upper", name="玩家", action="bet", wager=25))
+        self.assertEqual(self.store.record_frame("A", "old", new_hand)["added"], 0)
+        self.assertEqual(self.store.record_frame("A", "new", new_hand)["added"], 1)
+        self.assertEqual(self.store.bindings("A"), [
+            {"seat": "left_upper", "player_id": "123", "name": "玩家", "paused": False},
+        ])
+        self.assertEqual([(event["seat"], event["action"]) for event in self.store.events("123")],
+                         [("left_upper", "bet"), ("right_upper", "check")])
+
     def test_deduplicates_and_keeps_more_than_one_raise_per_street(self):
         self.store.bind("A", "right_upper", "123")
         for action, wager, baseline in [

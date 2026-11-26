@@ -14,14 +14,17 @@ import sys
 from tempfile import TemporaryDirectory
 import unicodedata
 
+from .avatar_match import avatar_signature
 from .layout import (
     BOARD_CARD_FIELDS as _BOARD_FIELDS,
+    EXTRA_SEAT_IDS,
     HERO_CARD_FIELDS as _HERO_FIELDS,
     SEAT_IDS,
     default_profile,
     detect_viewport,
     layout_warnings,
     pixel_regions,
+    responsive_profile,
     validate_viewport,
 )
 from .player_popup import POPUP_REGIONS, parse_popup
@@ -43,7 +46,9 @@ _ACTIONS = {
     "raise": "raise", "raiseto": "raise",
     "全下": "all_in", "全押": "all_in", "梭哈": "all_in", "allin": "all_in",
 }
-_SEAT_LABELS = frozenset({"空位", "坐下", "留座", "等待加入", "等待中", "离座", "離座"})
+_WAITING = frozenset({"等待中", "等待下一手", "等待下手", "等候下一手"})
+_SITTING_OUT = frozenset({"留座", "休息中", "暂离", "暫離", "sitout"})
+_SEAT_LABELS = _WAITING | _SITTING_OUT | frozenset({"空位", "坐下", "等待加入", "离座", "離座"})
 _VACANT_LABELS = frozenset({"空位", "坐下", "等待加入", "离座", "離座", "empty"})
 _AMOUNT = re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?([kmb万萬亿億])?", re.ASCII)
 _AMOUNT_PREFIX = re.compile(r"^(?:(?:总|總)?\s*底\s*池|total\s*pot|pot|筹码|籌碼)\s*:?\s*")
@@ -58,6 +63,8 @@ _RANK = re.compile(r"10|[2-9tjqka]", re.IGNORECASE)
 # Vision can return Cyrillic lookalikes even when the OCR language is English.
 _CARD_HOMOGLYPHS = str.maketrans("зсактнј", "3cakthj")
 _STREETS = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}
+_SPECTATOR_HINTS = ("spectator_hint_left", "spectator_hint_right")
+_SPECTATOR_TEXT = ("偷偷看牌", "发发看", "發發看")
 
 
 def live_profile():
@@ -79,14 +86,45 @@ def live_profile():
         regions[key] = {"x": x / 3024, "y": (y - 242) / 1470, "width": width / 3024,
                         "height": height / 1470, "kind": kind}
 
+    for seat, label_y, avatar_y, stack_y in (
+        ("top_center", 354, 423, 497), ("bottom_center", 1321, 1390, 1464),
+    ):
+        add(f"{seat}.label", 1424, label_y - 22, 176, 44, "label")
+        add(f"{seat}.avatar", 1466, avatar_y - 20, 92, 40, "label")
+        add(f"{seat}.stack", 1440, stack_y - 16, 144, 32, "number")
+        back_x = 1533 if seat == "top_center" else 1456
+        add(f"{seat}.cardback", back_x, avatar_y + 9, 43, 41, "marker")
+    for index, key in enumerate(_HERO_FIELDS):
+        add(key, 1432 + 86 * index, 1472, 75, 112, "card")
+    add("bottom_center.wager", 1595, 1337, 74, 40, "number")
+    add("top_center.wager", 1495, 517, 84, 40, "number")
+    add("top_right.wager", 1604, 515, 74, 40, "number")
+    add("spectator_hint_left", 1248, 1364, 176, 60, "label")
+    add("spectator_hint_right", 1599, 1364, 176, 60, "label")
+    add("hero_waiting_banner", 1386, 1218, 252, 53, "label")
     add("hero_passive_button", 1089, 1388, 1663, 220, "label")
     add("player_popup_id", 1384, 568, 235, 39, "label")
     add("player_popup_id_label", 1387, 569, 37, 37, "label")
     add("player_popup_id_value", 1425, 568, 194, 39, "number")
     add("player_popup_name", 1422, 517, 370, 51, "label")
+    add("player_popup_portrait", 1224, 525, 150, 150, "marker")
+    add("player_popup_panel", 1180, 482, 664, 1030, "marker")
+    add("table_stakes", 1372, 972, 85, 47, "label")
     for key, x in (("hands", 1284), ("win_rate", 1437), ("pot_entry_rate", 1589),
                    ("showdown_win_rate", 1740)):
         add(f"player_popup_{key}", x - 56, 875, 112, 45, "number")
+    for seat in SEAT_IDS + EXTRA_SEAT_IDS:
+        avatar = regions[f"{seat}.avatar"]
+        x = (avatar["x"] + avatar["width"] / 2) * 3024
+        y = (avatar["y"] + avatar["height"] / 2) * 1470 + 242
+        add(f"{seat}.portrait", x - 49, y - 49, 98, 98, "marker")
+        stack = regions[f"{seat}.stack"]
+        dealer_y = (stack["y"] + stack["height"] / 2) * 1470 + 242
+        distance = 108 if seat == "hero" else 75
+        if seat == "hero":
+            dealer_y = 1440
+        add(f"{seat}.dealer_left", x - distance - 16, dealer_y - 17, 33, 34, "label")
+        add(f"{seat}.dealer_right", x + distance - 16, dealer_y - 17, 33, 34, "label")
     return profile
 
 
@@ -225,17 +263,83 @@ def _seat(fields, seat, warnings):
     }
 
 
-def _table_state(fields):
+def _confirmed_seat(seat):
+    return seat["stack"] is not None and any(seat[key] is not None for key in ("name", "action", "wager"))
+
+
+def _seat_text(fields, seat):
+    return {_compact(text) for suffix in ("label", "status", "avatar")
+            for text in _texts(fields, f"{seat}.{suffix}")}
+
+
+def _table_state(fields, *, vacancy_markers=(), force_spectator=False, seat_capacity=None):
     warnings = []
-    seats = [_seat(fields, seat, warnings) for seat in SEAT_IDS]
+    by_id = {seat: _seat(fields, seat, warnings) for seat in SEAT_IDS}
+    vacancies = set(vacancy_markers)
+    for seat in SEAT_IDS + EXTRA_SEAT_IDS:
+        labels = _texts(fields, f"{seat}.label") + _texts(fields, f"{seat}.status")
+        if any(_compact(text) in _VACANT_LABELS for text in labels):
+            vacancies.add(seat)
+    observed_hero = [_card(fields, key) for key in _HERO_FIELDS]
+    hero_cards = observed_hero if all(observed_hero) and len(set(observed_hero)) == 2 else None
+    own_cards_visible = any(observed_hero) or any(fields.get(key, {}).get("card_surface") for key in _HERO_FIELDS)
+
+    alternate_warnings = []
+    top = _seat(fields, "top_center", alternate_warnings)
+    single_top = _confirmed_seat(top) or "top_center" in vacancies
+    twin_top = any(
+        _confirmed_seat(by_id[key]) or key in vacancies or (own_cards_visible and by_id[key]["stack"] is not None)
+        for key in ("top_left", "top_right")
+    )
+    eight_seats = seat_capacity == 8 or (seat_capacity is None and single_top and not twin_top)
+    if eight_seats:
+        seats = [top, *(seat for key, seat in by_id.items() if key not in {"top_left", "top_right"})]
+        warnings.extend(alternate_warnings)
+    else:
+        seats = list(by_id.values())
+
+    alternate_warnings = []
+    bottom = _seat(fields, "bottom_center", alternate_warnings)
+    hero_status = _seat_text(fields, "hero")
+    waiting_banner = any(_compact(text) in _WAITING for text in _texts(fields, "hero_waiting_banner"))
+    spectator_hint = any(
+        any(label in _compact(reading["text"]) for label in _SPECTATOR_TEXT)
+        for key in _SPECTATOR_HINTS for reading in fields.get(key, {}).get("observations", [])
+        if reading["confidence"] >= 0.75
+    )
+    other_seats_confirmed = sum(_confirmed_seat(seat) for seat in seats if seat["seat"] != "hero") >= 2
+    hero_evidence = own_cards_visible or waiting_banner or by_id["hero"]["stack"] is not None
+    spectating = force_spectator or (not hero_evidence and (
+        spectator_hint or (_confirmed_seat(bottom) and other_seats_confirmed)
+    ))
+    if spectating:
+        seats = [bottom if seat["seat"] == "hero" else seat for seat in seats]
+        hero_cards = None
+        warnings.extend(alternate_warnings)
+        hero_state = "spectating"
+    elif waiting_banner or (hero_evidence and hero_status & _WAITING):
+        hero_state = "waiting_for_hand"
+    elif hero_evidence and hero_status & _SITTING_OUT:
+        hero_state = "sitting_out"
+    elif by_id["hero"]["action"] == "fold":
+        hero_state = "folded"
+    else:
+        hero_state = "playing" if own_cards_visible else "unknown"
+    if hero_state in {"waiting_for_hand", "sitting_out"}:
+        if by_id["hero"]["stack"] is None:
+            by_id["hero"]["stack"] = bottom["stack"]
+        hero_cards = None
+    inactive = [row["seat"] for row in seats if row["seat"] not in vacancies and (
+        hero_state in {"waiting_for_hand", "sitting_out"} if row["seat"] == "hero"
+        else bool(_seat_text(fields, row["seat"]) & (_WAITING | _SITTING_OUT))
+    )]
+
     pot = _read_amount(fields, "pot", warnings)
     center_pot = _read_amount(fields, "center_pot", warnings)
     if pot is not None or center_pot is not None:
         warnings.append("pot 为顶部可见读数，center_pot 为下一行读数；入池口径和本街投入请结合画面核对。")
 
-    observed_hero = [_card(fields, key) for key in _HERO_FIELDS]
     observed_board = [_card(fields, key) for key in _BOARD_FIELDS]
-    hero_cards = observed_hero if all(observed_hero) and len(set(observed_hero)) == 2 else None
     card_slots = [
         card is not None or fields.get(key, {}).get("card_surface") is True
         for key, card in zip(_BOARD_FIELDS, observed_board)
@@ -252,7 +356,7 @@ def _table_state(fields):
     if hero_cards is not None and board is not None and set(hero_cards).intersection(board):
         warnings.append("手牌和公共牌出现重复牌，请手动核对。")
         hero_cards = board = None
-    if hero_cards is None:
+    if hero_cards is None and hero_state in {"playing", "unknown"}:
         warnings.append("手牌无法完整确认，请核对牌点和花色。")
     if board is None:
         warnings.append("公共牌无法完整确认，请核对牌点、花色和公共牌数量。")
@@ -261,12 +365,13 @@ def _table_state(fields):
 
     return {
         "seats": seats,
-        "vacant_seats": [
-            seat for seat in SEAT_IDS if any(
-                _compact(text) in _VACANT_LABELS
-                for text in _texts(fields, f"{seat}.label") + _texts(fields, f"{seat}.status")
-            )
-        ],
+        "spectating": spectating,
+        "hero_evidence": hero_evidence,
+        "hero_state": hero_state,
+        "seat_capacity": len(seats),
+        "seat_layout_confirmed": seat_capacity is not None or single_top != twin_top,
+        "vacant_seats": [row["seat"] for row in seats if row["seat"] in vacancies],
+        "inactive_seats": inactive,
         "hero_cards": hero_cards,
         "board": board,
         "street": street,
@@ -313,15 +418,16 @@ def _read_vision(path, viewport, regions):
     return fields
 
 
-def _open_image(source):
+def _open_image(source, *, keep_alpha=False):
     try:
         from PIL import Image, ImageOps
     except ImportError as exc:
         raise RecognitionError("自动定位或屏幕抓取需要 Pillow，请安装 .[live] 或 .[ocr]") from exc
     if isinstance(source, Image.Image):
-        return source.convert("RGB")
+        return source if keep_alpha else source.convert("RGB")
     with Image.open(source) as image:
-        return ImageOps.exif_transpose(image).convert("RGB")
+        image = ImageOps.exif_transpose(image)
+        return image.copy() if keep_alpha else image.convert("RGB")
 
 
 def _fields(source, viewport, regions, backend=None):
@@ -391,8 +497,58 @@ def _vacancy_marker(image):
     return horizontal >= 10 and vertical >= 12 and corners <= 2
 
 
+def _visible_white_badge(image):
+    colors = image.resize((12, 12)).get_flattened_data()
+    return sum(min(pixel) >= 170 and max(pixel) - min(pixel) <= 45 for pixel in colors) >= 25
+
+
+def _overlap(first, second):
+    if second is None:
+        return False
+    x, y, w, h = first
+    a, b, c, d = second
+    return max(x, a) < min(x + w, a + c) and max(y, b) < min(y + h, b + d)
+
+
+def _safe_dismiss_point(image, viewport, panel):
+    x, y, w, h = viewport
+    for fraction in (0.28, 0.72):
+        px, py = round(x + fraction * w), round(y + 0.105 * h)
+        box = (px - 16, py - 16, 32, 32)
+        if _overlap(box, panel):
+            continue
+        colors = _region_image(image, box).resize((6, 6)).get_flattened_data()
+        if all(g >= r + 14 and g >= b + 5 and g >= 45 for r, g, b in colors):
+            return (px, py)
+    return None
+
+
+def _popup_window_viewport(image, profile, adaptive):
+    """Recognize a centered profile panel when it splits the green table."""
+    image = image.convert("RGB")
+    width, height = image.size
+    pixels = image.load()
+    columns = [int(width * fraction) for fraction in (0.04, 0.19, 0.25, 0.75, 0.81, 0.96)]
+
+    def felt_row(y):
+        shades = [pixels[x, y] for x in columns]
+        return sum(g >= r + 14 and g >= b + 5 and g >= 45 for r, g, b in shades) >= 5
+
+    step = max(1, height // 450)
+    for y in range(0, height // 3, step):
+        if not all(felt_row(y + offset) for offset in (0, step * 3, height // 9, height // 4)):
+            continue
+        top = next((k for k in range(max(0, y - step), y) if felt_row(k)), y)
+        candidate = (0, top, width, height - top)
+        adjusted = responsive_profile(profile, candidate) if adaptive else profile
+        if adjusted and _popup_badge(image, adjusted, candidate):
+            return candidate
+        break
+    return None
+
+
 def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=False, backend=None,
-              popup_fallback=None):
+              popup_fallback=None, window_capture=False, force_spectator=False, seat_capacity=None):
     """Read visible table fields from a saved screenshot or a Pillow image."""
     try:
         viewport = validate_viewport(viewport)
@@ -402,51 +558,100 @@ def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=F
         image = Path(image).expanduser()
         if not image.is_file():
             raise RecognitionError(f"找不到截图文件：{image}")
-    profile = profile or (live_profile() if live else default_profile())
+    adaptive = profile is None and (live or window_capture)
+    profile = profile or (live_profile() if live or window_capture else default_profile())
     has_pixels = not isinstance(image, Path) or auto_viewport or live
     if has_pixels:
-        image = _open_image(image)
+        image = _open_image(image, keep_alpha=window_capture)
         if auto_viewport and viewport is None:
-            viewport = detect_viewport(image)
+            viewport = detect_viewport(image, window=window_capture)
             if viewport is None and live and popup_fallback:
                 try:
                     fallback = validate_viewport(popup_fallback, image.size)
                 except ValueError:
                     fallback = None
-                if fallback and _popup_badge(image, profile, fallback):
-                    viewport = fallback
+                if fallback:
+                    popup_profile = responsive_profile(profile, fallback) if adaptive else profile
+                    if popup_profile and _popup_badge(image.convert("RGB"), popup_profile, fallback):
+                        viewport = fallback
+            if viewport is None and live and window_capture:
+                viewport = _popup_window_viewport(image, profile, adaptive)
             if viewport is None:
                 raise RecognitionError("未定位到单一横向绿色牌桌，请核对可见窗口或指定 --viewport")
         try:
             viewport = validate_viewport(viewport, image.size) or (0, 0, *image.size)
         except ValueError as exc:
             raise RecognitionError(str(exc)) from exc
+        if image.mode != "RGB":
+            image = image.convert("RGB")
 
+    if adaptive:
+        profile = responsive_profile(profile, viewport) or profile
     warnings = layout_warnings(profile, viewport) if viewport else []
     if live and warnings:
         raise RecognitionError(warnings[0])
     if live and backend is None and find_spec("rapidocr") and find_spec("onnxruntime"):
         backend = "portable"
     popup_badge = live and _popup_badge(image, profile, viewport)
+    pixels = pixel_regions(profile, viewport) if live else {}
+    panel = pixels.get("player_popup_panel") if popup_badge else None
     regions = {
         key: bounds for key, bounds in profile.regions.items()
         if bounds["kind"] != "marker" and (key not in POPUP_REGIONS or popup_badge)
+        and (not key.rsplit(".", 1)[-1].startswith("dealer_") or (
+            live and not popup_badge and _visible_white_badge(_region_image(image, pixels[key]))
+        ))
     }
     fields = _fields(image, viewport, regions, backend)
-    result = _table_state(fields)
+    empty = [
+        key.partition(".")[0] for key, bounds in pixels.items()
+        if key.endswith(".avatar") and not _overlap(bounds, panel)
+        and _vacancy_marker(_region_image(image, bounds))
+    ]
+    result = _table_state(fields, vacancy_markers=empty, force_spectator=force_spectator,
+                          seat_capacity=seat_capacity)
     if viewport is not None:
         result["viewport"] = list(viewport)
         result["warnings"].extend(warnings)
         result["layout_mismatch"] = bool(warnings)
     if live:
         result["cardbacks"] = []
-        for key, bounds in pixel_regions(profile, viewport).items():
+        enabled_seats = {seat["seat"] for seat in result["seats"]}
+        for key, bounds in pixels.items():
             seat, _, field = key.partition(".")
+            if seat not in enabled_seats:
+                continue
             if field == "cardback" and _has_cardback(_region_image(image, bounds)):
                 result["cardbacks"].append(seat)
-            if field == "avatar" and _vacancy_marker(_region_image(image, bounds)):
-                if seat not in result["vacant_seats"]:
-                    result["vacant_seats"].append(seat)
+        result["seat_avatars"] = {
+            key.partition(".")[0]: signature for key, bounds in pixels.items()
+            if key.endswith(".portrait") and (popup_badge or key.partition(".")[0] in enabled_seats)
+            and key.partition(".")[0] not in empty and not _overlap(bounds, panel)
+            and (signature := avatar_signature(_region_image(image, bounds))) is not None
+        }
+        if popup_badge and (portrait := pixels.get("player_popup_portrait")) is not None:
+            result["popup_avatar"] = avatar_signature(_region_image(image, portrait))
+            extra = [
+                _seat(fields, seat, []) for seat in SEAT_IDS + EXTRA_SEAT_IDS
+                if seat not in enabled_seats and f"{seat}.avatar" in pixels
+            ]
+            result["popup_seat_candidates"] = [*result["seats"], *extra]
+            result["dismiss_popup_point"] = _safe_dismiss_point(image, viewport, panel)
+        if not popup_badge:
+            from .table_positions import read_table_positions
+
+            result["positions"] = read_table_positions(
+                fields, result["seats"], result["vacant_seats"], result["street"],
+                inactive_seats=result["inactive_seats"],
+            )
+            if result["spectating"] and not result["hero_evidence"] and result["seat_layout_confirmed"]:
+                result["avatar_points"] = {
+                    row["seat"]: (box[0] + box[2] // 2, box[1] + box[3] // 2)
+                    for row in result["seats"]
+                    if row["seat"] in result["seat_avatars"]
+                    and row["seat"] not in result["vacant_seats"] and _confirmed_seat(row)
+                    and (box := pixels.get(f"{row['seat']}.portrait")) is not None
+                }
         result["popup_open"] = bool(popup_badge)
         popup = parse_popup(fields, badge=True) if popup_badge else None
         result["player_popup"] = asdict(popup) if popup is not None else None

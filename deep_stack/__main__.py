@@ -54,6 +54,11 @@ def _add_layout(parser, *, auto=False):
         parser.add_argument("--auto-viewport", action="store_true", help="自动定位横向绿色牌桌")
 
 
+def _add_window(parser):
+    parser.add_argument("--window-id", type=int, metavar="ID",
+                        help="指定 macOS 窗口 ID，默认优先捕捉 WePoker-H5")
+
+
 def _parser():
     parser = argparse.ArgumentParser(description="从本地牌桌截图提取观察记录并复盘筹码 EV。")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -65,6 +70,7 @@ def _parser():
 
     capture = commands.add_parser("capture", help="从当前屏幕采集一次牌桌截图")
     _add_layout(capture, auto=True)
+    _add_window(capture)
     _add_output(capture)
 
     layout = commands.add_parser("layout-template", help="导出按位置比例配置的布局模板")
@@ -73,6 +79,7 @@ def _parser():
 
     live = commands.add_parser("live", help="连续识别画面并在确认轮到自己时输出条件 EV")
     _add_layout(live)
+    _add_window(live)
     live.add_argument("--model", type=Path, help="对手范围、应答及牌桌金额口径配置")
     live.add_argument("--frames", type=Path, nargs="+", metavar="IMAGE", help="回放本地截图序列")
     live.add_argument("--samples", type=int, default=1500, help="每次蒙特卡洛计算的样本数")
@@ -80,6 +87,10 @@ def _parser():
     live.add_argument("--max-age", type=float, default=3.0, help="最大可用读数时长（秒）")
     live.add_argument("--json", action="store_true", help="逐行输出 JSON")
     live.add_argument("--session", help="牌桌会话 ID，默认生成新 ID")
+    live.add_argument("--spectate", action="store_true", help="观战模式，底部座位视为普通玩家")
+    live.add_argument("--table-seats", type=int, choices=(8, 9), help="指定实体座位数量，默认自动判断")
+    live.add_argument("--scan-avatars", action="store_true", help="macOS 或 Windows 观战时依次打开未绑定玩家的头像")
+    live.add_argument("--quiet-actions", action="store_true", help="只隐藏终端的动作和牌桌摘要")
     live_log = live.add_mutually_exclusive_group()
     live_log.add_argument("--db", type=Path, help="本地玩家 SQLite 路径")
     live_log.add_argument("--no-player-log", action="store_true", help="关闭玩家动作归档")
@@ -145,13 +156,14 @@ def _write_json(result, path):
             tmp.unlink(missing_ok=True)
 
 
-def _observe(images, viewport=None, *, profile=None, auto_viewport=False):
+def _observe(images, viewport=None, *, profile=None, auto_viewport=False, window_capture=False):
     from .recognition import recognize
 
     frames = []
     for image in images:
         try:
-            frame = recognize(image, viewport=viewport, profile=profile, auto_viewport=auto_viewport)
+            frame = recognize(image, viewport=viewport, profile=profile, auto_viewport=auto_viewport,
+                              window_capture=window_capture)
         except (OSError, ValueError) as exc:
             raise ValueError(f"{getattr(image, 'name', '屏幕')}：{exc}") from exc
         frames.append({**frame, "source": getattr(image, "name", "screen")})
@@ -159,10 +171,13 @@ def _observe(images, viewport=None, *, profile=None, auto_viewport=False):
 
 
 def _capture(args, profile):
-    if sys.platform != "darwin" or getattr(sys, "frozen", False) or args.viewport or args.auto_viewport:
-        from .recognition import screen_image
+    if (sys.platform != "darwin" or getattr(sys, "frozen", False)
+            or args.viewport or args.auto_viewport or args.window_id is not None):
+        from .live import LiveCapture
 
-        return _observe([screen_image()], args.viewport, profile=profile, auto_viewport=args.viewport is None)
+        image, captured_window = LiveCapture(args.window_id, prefer_window=args.viewport is None).read()
+        return _observe([image], args.viewport, profile=profile, auto_viewport=args.viewport is None,
+                        window_capture=captured_window is not None)
     with TemporaryDirectory(prefix="deep-stack-") as folder:
         path = Path(folder) / "capture.png"
         print("请框选网页内完整牌桌，按 Esc 取消。", file=sys.stderr)
@@ -208,6 +223,11 @@ def _run(args):
         profile = load_profile(args.layout) if args.layout else None
         if args.command == "observe":
             return _observe(args.images, args.viewport, profile=profile, auto_viewport=args.auto_viewport)
+        if args.window_id is not None:
+            if sys.platform != "darwin" or not 1 <= args.window_id <= 2**32 - 1:
+                raise ValueError("--window-id 需要 macOS 的正整数窗口 ID")
+            if getattr(args, "frames", None):
+                raise ValueError("--window-id 不能与 --frames 同时使用")
         if args.command == "capture":
             return _capture(args, profile)
         from .live import scan_live
@@ -216,11 +236,17 @@ def _run(args):
             raise ValueError("采样间隔和读数时限须为正数")
         if not 100 <= args.samples <= 200000:
             raise ValueError("samples 必须是 100 到 200000 之间的整数")
+        if args.scan_avatars and (
+            sys.platform not in {"darwin", "win32"} or args.frames or args.no_player_log or not args.spectate
+        ):
+            raise ValueError("--scan-avatars 需要 macOS 或 Windows 实时窗口、--spectate 和本机玩家记录")
         model = _read_json(args.model) if args.model else {"pot_includes_wagers": profile is None}
         db = args.db if args.frames else (None if args.no_player_log else args.db or Path("players.sqlite3"))
         scan_live(frames=args.frames, viewport=args.viewport, profile=profile, model=model,
                   samples=args.samples, interval=args.interval, max_age=args.max_age,
-                  json_lines=args.json, database=db, session=args.session or uuid4().hex[:12])
+                  json_lines=args.json, database=db, session=args.session or uuid4().hex[:12],
+                  window_id=args.window_id, force_spectator=args.spectate, seat_capacity=args.table_seats,
+                  show_actions=not args.quiet_actions, scan_avatars=args.scan_avatars)
         return None
     if args.command == "layout-template":
         from .layout import profile_template

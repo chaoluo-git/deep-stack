@@ -5,6 +5,8 @@ from decimal import Decimal
 import re
 import unicodedata
 
+from .avatar_match import match_avatar
+
 
 _ID_PREFIX = r"(?:玩家|用户|用戶|user|player)?id[:#]*"
 _ID_LINE = re.compile(_ID_PREFIX + r"(?P<id>[0-9]{4,24})")
@@ -154,25 +156,40 @@ def parse_popup(fields, *, badge=False):
     return PlayerPopup(ids.pop(), next(iter(names), None), stats)
 
 
-def match_popup(popup, seats, *, previous_seats=()):
-    """Match a shown popup nickname to one seat across adjacent trusted frames."""
-    if popup is None or popup.name is None:
+def nickname_key(value):
+    """Normalize spacing from OCR without dropping meaningful characters."""
+    return "".join(_normalized(value).split()) if isinstance(value, str) else ""
+
+
+def match_popup(popup, seats, *, previous_seats=(), popup_avatar=None, seat_avatars=None):
+    """Resolve one seat from independent, non-conflicting nickname and avatar evidence."""
+    if popup is None:
         return None
+
+    popup_name = nickname_key(popup.name)
     current = {seat["seat"]: seat for seat in seats}
     matches = set()
     names = {}
     for seat in (*current.values(), *previous_seats):
-        raw_name = seat.get("name")
-        if not isinstance(raw_name, str) or not (name := _popup_name(raw_name)):
+        name = nickname_key(seat.get("name"))
+        if not name or seat.get("vacant"):
             continue
         seat_id = seat["seat"]
         names.setdefault(seat_id, set()).add(name)
-        if name == popup.name:
+        if name == popup_name:
             matches.add(seat_id)
+
+    avatar_seat = match_avatar(popup_avatar, {
+        seat_id: views for seat_id, views in (seat_avatars or {}).items()
+        if seat_id in current and not current[seat_id].get("vacant")
+    })
+    if avatar_seat is not None:
+        return avatar_seat if not matches or avatar_seat in matches else None
+
     if len(matches) != 1:
         return None
     seat = matches.pop()
     visible_seat = current.get(seat)
-    if not visible_seat or visible_seat.get("vacant") or names[seat] != {popup.name}:
+    if not visible_seat or visible_seat.get("vacant") or names[seat] != {popup_name}:
         return None
     return seat

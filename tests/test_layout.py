@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from deep_stack.layout import (
+    EXTRA_SEAT_IDS,
     default_profile,
     detect_viewport,
     layout_warnings,
@@ -14,6 +15,7 @@ from deep_stack.layout import (
     parse_profile,
     pixel_regions,
     profile_template,
+    responsive_profile,
     validate_viewport,
 )
 
@@ -28,6 +30,35 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(layout_warnings(profile, (12, 61, 1512, 735)), [])
         self.assertIn("宽高比", layout_warnings(profile, (40, 6, 1280, 800))[0])
 
+    def test_split_screen_uses_measured_seat_anchors_and_keeps_cards_wide(self):
+        profile = default_profile()
+        viewport = (0, 242, 1512, 1482)
+        adapted = responsive_profile(profile, viewport)
+        self.assertIsNotNone(adapted)
+        self.assertEqual(layout_warnings(adapted, viewport), [])
+        boxes = pixel_regions(adapted, viewport)
+        for region, center in (("left_middle.avatar", 182), ("hero.avatar", 756),
+                               ("right_middle.avatar", 1330)):
+            with self.subTest(region=region):
+                x, _, width, _ = boxes[region]
+                self.assertAlmostEqual(x + width / 2, center, delta=1)
+                self.assertGreaterEqual(width, 92)
+
+        x, y, width, height = boxes["board_card_0"]
+        self.assertAlmostEqual(x, 551, delta=1)
+        self.assertAlmostEqual(y, 862, delta=1)
+        self.assertGreaterEqual(width, 78)
+        self.assertGreaterEqual(height, 113)
+
+        mid_view = (0, 242, 2271, 1476)
+        mid = pixel_regions(responsive_profile(profile, mid_view), mid_view)
+        x, _, width, _ = mid["left_middle.avatar"]
+        self.assertAlmostEqual(x + width / 2, 249, delta=2)
+        self.assertEqual(responsive_profile(profile, (0, 242, 3024, 1470)), profile)
+        self.assertIsNotNone(responsive_profile(profile, (0, 242, 1510, 1482)))
+        self.assertIsNone(responsive_profile(profile, (0, 242, 1400, 1482)))
+        self.assertIsNone(responsive_profile(profile, (0, 0, 3500, 1470)))
+
     def test_profile_accepts_normalized_overrides_and_new_live_fields(self):
         profile = parse_profile({
             "version": 1,
@@ -37,6 +68,9 @@ class LayoutTests(unittest.TestCase):
                 "top_right.status": {"x": 0.5, "y": 0.25, "width": 0.125, "height": 0.125},
                 "hero.wager": {"x": 0.25, "y": 0.125, "width": 0.25, "height": 0.125},
                 "hero.cardback": {"x": 0.25, "y": 0.125, "width": 0.25, "height": 0.125},
+                "top_center.label": {"x": 0.5, "y": 0.125, "width": 0.25, "height": 0.125},
+                "bottom_center.stack": {"x": 0.5, "y": 0.875, "width": 0.25, "height": 0.125},
+                "spectator_hint_left": {"x": 0.25, "y": 0.75, "width": 0.25, "height": 0.125},
                 "center_pot": None,
             },
         })
@@ -45,6 +79,10 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(profile.regions["hero.wager"]["kind"], "number")
         self.assertEqual(profile.regions["hero.cardback"]["kind"], "marker")
         self.assertEqual(profile.regions["top_right.status"]["kind"], "label")
+        self.assertEqual(EXTRA_SEAT_IDS, ("top_center", "bottom_center"))
+        self.assertEqual(profile.regions["top_center.label"]["kind"], "label")
+        self.assertEqual(profile.regions["bottom_center.stack"]["kind"], "number")
+        self.assertEqual(profile.regions["spectator_hint_left"]["kind"], "label")
         self.assertEqual(profile.regions["pot"], default_profile().regions["pot"])
         self.assertNotIn("center_pot", boxes)
         self.assertEqual(layout_warnings(profile, (10, 20, 1200, 800)), [])
@@ -144,6 +182,54 @@ class AutomaticViewportTests(unittest.TestCase):
             draw.rectangle((left, 129, left + 750, 674), fill=(13, 109, 97))
             draw.rectangle((left, 675, left + 750, 707), fill=(31, 31, 34))
         self.assertIsNone(detect_viewport(desktop))
+        self.assertIsNone(detect_viewport(desktop, window=True))
+
+    def test_recovers_window_bounds_with_a_shadow_and_a_changing_popup(self):
+        from PIL import Image, ImageDraw
+
+        screenshot = Image.new("RGBA", (1660, 936), (10, 83, 64, 120))
+        draw = ImageDraw.Draw(screenshot)
+        draw.rectangle((52, 33, 1563, 888), fill=(228, 229, 234, 255))
+        draw.rectangle((52, 154, 1563, 827), fill=(13, 109, 97, 255))
+        draw.rectangle((52, 828, 1563, 888), fill=(26, 25, 35, 255))
+
+        expected = (52, 154, 1512, 735)
+        self.assertEqual(detect_viewport(screenshot, window=True), expected)
+        for popup in ((630, 365, 987, 550), (630, 324, 987, 888), (630, 278, 987, 701)):
+            with self.subTest(popup=popup):
+                frame = screenshot.copy()
+                ImageDraw.Draw(frame).rectangle(popup, fill=(31, 36, 35, 255))
+                self.assertEqual(detect_viewport(frame, window=True), expected)
+
+    def test_known_window_still_rejects_large_occlusion_or_unrelated_bottom_panel(self):
+        from PIL import Image, ImageDraw
+
+        screenshot = Image.new("RGB", (1512, 856), (228, 229, 234))
+        draw = ImageDraw.Draw(screenshot)
+        draw.rectangle((0, 121, 1511, 804), fill=(13, 109, 97))
+        draw.rectangle((0, 805, 1511, 855), fill=(26, 25, 35))
+        self.assertEqual(detect_viewport(screenshot, window=True), (0, 121, 1512, 735))
+
+        draw.rectangle((400, 245, 1010, 630), fill=(244, 240, 239))
+        self.assertIsNone(detect_viewport(screenshot, window=True))
+
+        draw.rectangle((0, 121, 1511, 680), fill=(13, 109, 97))
+        draw.rectangle((0, 681, 1511, 855), fill=(244, 240, 239))
+        self.assertIsNone(detect_viewport(screenshot, window=True))
+
+
+    def test_split_screen_keeps_footer_below_a_curved_table(self):
+        from PIL import Image, ImageDraw
+
+        screenshot = Image.new("RGBA", (1512, 1724), (228, 229, 234, 255))
+        draw = ImageDraw.Draw(screenshot)
+        draw.rectangle((0, 242, 1511, 1723), fill=(26, 25, 35, 255))
+        draw.polygon([
+            (0, 242), (1511, 242), (1511, 1504), (1285, 1564), (1209, 1584),
+            (1103, 1604), (1027, 1624), (970, 1626), (772, 1645),
+            (739, 1645), (541, 1626), (484, 1624), (408, 1604), (302, 1584), (226, 1564), (0, 1504),
+        ], fill=(13, 109, 97, 255))
+        self.assertEqual(detect_viewport(screenshot, window=True), (0, 242, 1512, 1482))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from math import isfinite
 from pathlib import Path
 import re
 import sqlite3
+import unicodedata
 
 
 _PLAYER_ID = re.compile(r"[0-9]*[1-9][0-9]*")
@@ -91,6 +92,40 @@ def _name(value):
     return value.strip() or None
 
 
+def _name_key(value):
+    return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _reliable_name(frame, seat, name):
+    if not name:
+        return False
+    evidence = frame.get("evidence")
+    if evidence is None:
+        # Explicit readings supplied directly by callers already name the seat.
+        return True
+    observations = evidence.get(f"{seat}.label", {}).get("observations", ())
+    return any(
+        isinstance(observation.get("text"), str)
+        and _name_key(observation["text"]) == _name_key(name)
+        and observation.get("confidence", 0) >= 0.85
+        for observation in observations
+    )
+
+
+def _seat_readings(frame):
+    if not isinstance(frame, dict) or not isinstance(frame.get("seats"), list):
+        raise ValueError("观察帧需要座位列表 seats")
+    seats = {}
+    for reading in frame["seats"]:
+        if not isinstance(reading, dict):
+            raise ValueError("观察帧的座位读数必须是对象")
+        seat = _key(reading.get("seat"), "座位")
+        if seat in seats:
+            raise ValueError(f"同一帧出现重复座位 {seat}")
+        seats[seat] = reading
+    return seats
+
+
 def _visible_wager(value):
     if value is None:
         return None
@@ -151,16 +186,21 @@ class PlayerStore:
             yield
 
     def bind(self, session_id, seat, player_id, *, name=None):
-        """Bind an explicitly confirmed ID, or resume a paused binding."""
+        """Bind a confirmed ID, including a move from a paused seat."""
         session_id, seat = _key(session_id, "场次"), _key(seat, "座位")
         player_id, name = _player_id(player_id), _name(name)
         with self._write():
             existing = self._db.execute(
-                "SELECT seat FROM seat_bindings WHERE session_id = ? AND player_id = ?",
+                "SELECT seat, paused FROM seat_bindings WHERE session_id = ? AND player_id = ?",
                 (session_id, player_id),
             ).fetchone()
             if existing and existing["seat"] != seat:
-                raise ValueError(f"该 ID 已绑定本场次的 {existing['seat']}，请先解除旧座位绑定")
+                if not existing["paused"]:
+                    raise ValueError(f"该 ID 已绑定本场次的 {existing['seat']}，请先解除旧座位绑定")
+                self._db.execute(
+                    "DELETE FROM seat_bindings WHERE session_id = ? AND seat = ?",
+                    (session_id, existing["seat"]),
+                )
             self._db.execute("INSERT OR IGNORE INTO players (player_id) VALUES (?)", (player_id,))
             self._db.execute(
                 """INSERT INTO seat_bindings (session_id, seat, player_id, name)
@@ -186,27 +226,47 @@ class PlayerStore:
         )
         return [{**dict(row), "paused": bool(row["paused"])} for row in rows]
 
+    def _pause(self, session_id, seat):
+        self._db.execute(
+            "UPDATE seat_bindings SET paused = 1 WHERE session_id = ? AND seat = ?",
+            (session_id, seat),
+        )
+
+    def reconcile_seats(self, session_id, frame, *, changed_seats=()):
+        """Pause active bindings on positive seat-change evidence, even between hands."""
+        session_id = _key(session_id, "场次")
+        seats = _seat_readings(frame)
+        changed = set(changed_seats) | set(frame.get("vacant_seats", ()))
+        paused = []
+        with self._write():
+            for binding in self.bindings(session_id):
+                if binding["paused"]:
+                    continue
+                seat = binding["seat"]
+                name = _name(seats.get(seat, {}).get("name"))
+                name_changed = (
+                    name and binding["name"] and _name_key(name) != _name_key(binding["name"])
+                    and _reliable_name(frame, seat, name)
+                )
+                if seat in changed or name_changed:
+                    self._pause(session_id, seat)
+                    paused.append(seat)
+        return paused
+
     def record_frame(self, session_id, hand_id, frame):
         """Record visible labels under the currently bound stable player IDs."""
         session_id, hand_id = _key(session_id, "场次"), _key(hand_id, "手牌")
-        if not isinstance(frame, dict) or not isinstance(frame.get("seats"), list):
-            raise ValueError("观察帧需要座位列表 seats")
+        seats = _seat_readings(frame)
         street = frame.get("street")
         if street is not None and street not in _STREETS:
             raise ValueError("观察帧的街次无效")
         added = updated = 0
         vacant = set(frame.get("vacant_seats", []))
+        inactive = set(frame.get("inactive_seats", ()))
         paused = set()
-        seen = set()
         with self._write():
             bindings = {row["seat"]: row for row in self.bindings(session_id)}
-            for reading in frame["seats"]:
-                if not isinstance(reading, dict):
-                    raise ValueError("观察帧的座位读数必须是对象")
-                seat = _key(reading.get("seat"), "座位")
-                if seat in seen:
-                    raise ValueError(f"同一帧出现重复座位 {seat}")
-                seen.add(seat)
+            for seat, reading in seats.items():
                 binding = bindings.get(seat)
                 if binding is None:
                     continue
@@ -214,18 +274,21 @@ class PlayerStore:
                     paused.add(seat)
                     continue
                 name = _name(reading.get("name"))
-                if seat in vacant or (name and binding["name"] and name != binding["name"]):
-                    self._db.execute(
-                        "UPDATE seat_bindings SET paused = 1 WHERE session_id = ? AND seat = ?",
-                        (session_id, seat),
-                    )
-                    paused.add(seat)
+                name_changed = name and binding["name"] and _name_key(name) != _name_key(binding["name"])
+                if seat in vacant or name_changed:
+                    if seat in vacant or _reliable_name(frame, seat, name):
+                        self._pause(session_id, seat)
+                        paused.add(seat)
+                    # A weak conflicting read cannot invalidate the binding,
+                    # but this frame cannot safely be attributed to the ID.
                     continue
-                if name and not binding["name"]:
+                if not binding["name"] and _reliable_name(frame, seat, name):
                     self._db.execute(
                         "UPDATE seat_bindings SET name = ? WHERE session_id = ? AND seat = ?",
                         (name, session_id, seat),
                     )
+                if seat in inactive:
+                    continue
                 kind = reading.get("action")
                 if kind is not None and kind not in _ACTIONS:
                     raise ValueError(f"观察帧的动作无效：{kind}")
@@ -233,14 +296,17 @@ class PlayerStore:
                     continue
                 key = (session_id, hand_id, seat, binding["player_id"])
                 self._db.execute(
-                    "INSERT OR IGNORE INTO hand_seats (session_id, hand_id, seat, player_id) VALUES (?, ?, ?, ?)",
-                    key,
+                    """INSERT OR IGNORE INTO hand_seats (session_id, hand_id, seat, player_id)
+                       SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+                           SELECT 1 FROM hand_seats WHERE session_id = ? AND hand_id = ? AND player_id = ?
+                       )""",
+                    (*key, session_id, hand_id, binding["player_id"]),
                 )
                 previous_player = self._db.execute(
                     "SELECT player_id FROM hand_seats WHERE session_id = ? AND hand_id = ? AND seat = ?",
                     key[:3],
                 ).fetchone()
-                if kind and previous_player["player_id"] == binding["player_id"]:
+                if kind and previous_player and previous_player["player_id"] == binding["player_id"]:
                     change = self._record_action(key, kind, street, _visible_wager(reading.get("wager")))
                     added += change == "added"
                     updated += change == "updated"

@@ -179,9 +179,12 @@ def _match_suit(image):
         return None
 
     matches = []
+    # A darkened red pip can lie below the black brightness cutoff.
+    # The black mask requires near-neutral ink so both groups cannot claim it.
+    black_ink = (color.max(axis=2) <= 105) & (np.ptp(color, axis=2) <= 26)
     inks = (
         ((red >= green + 48) & (red >= blue + 32), ("h", "d"), 0.86, 0.07),
-        (color.max(axis=2) <= 105, ("s", "c"), 0.87, 0.04),
+        (black_ink, ("s", "c"), 0.87, 0.04),
     )
     # An edge of the rank or the illustration can enter this crop. Match only
     # separated ink components whose centers could belong to the suit symbol.
@@ -309,6 +312,20 @@ def read_fields(path, *, viewport=None, regions):
             else:
                 # A control crop may contain multiple buttons or adjacent checkboxes.
                 detect = name.startswith("hero_") and name.endswith("_button")
+                if name == "table_stakes":
+                    # Muted table text contrasts most strongly with the green
+                    # felt in the red channel. Small badges benefit from scale.
+                    channel = ImageOps.autocontrast(image.getchannel("R"), cutoff=2)
+                    image = channel.resize((image.width * 2, image.height * 2), Image.Resampling.BICUBIC).convert("RGB")
+                elif name.endswith((".dealer_left", ".dealer_right")):
+                    gray = ImageOps.grayscale(image)
+                    badge = gray.point(lambda value: 255 if value >= 175 else 0).getbbox()
+                    if badge is not None:
+                        x, y, right, bottom = badge
+                        pad_x, pad_y = (right - x) // 6, (bottom - y) // 6
+                        gray = gray.crop((x + pad_x, y + pad_y, right - pad_x, bottom - pad_y))
+                    gray = ImageOps.expand(ImageOps.autocontrast(gray), border=3, fill=255)
+                    image = gray.resize((gray.width * 3, gray.height * 3), Image.Resampling.BICUBIC).convert("RGB")
                 field = {
                     "observations": [] if _appears_blank(image) else _ocr(image, detect=detect),
                     "empty_felt": False,

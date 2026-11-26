@@ -5,12 +5,13 @@ from decimal import Decimal
 import json
 from pathlib import Path
 import re
+import sys
 from time import monotonic, sleep
 import unicodedata
 from uuid import uuid4
 
 from .ev import analyze
-from .player_popup import PlayerPopup, match_popup
+from .player_popup import PlayerPopup, match_popup, nickname_key
 
 
 _SECONDS = re.compile(r"([1-9]\d?)\s*(?:s|秒)", re.IGNORECASE)
@@ -66,6 +67,16 @@ def _control(frame, key, kinds):
 def _state(frame, model):
     if frame.get("layout_mismatch"):
         return None, "窗口比例偏离现有布局，请加载对应的 --layout", None
+    if frame.get("spectating"):
+        if frame.get("hero_evidence"):
+            return None, "观战模式暂停扫描，画面出现本人入座信号", None
+        return None, "观战中，已识别可见牌桌", None
+    if frame.get("hero_state") == "waiting_for_hand":
+        return None, "已入座，等待下一手发牌", None
+    if frame.get("hero_state") == "sitting_out":
+        return None, "本人当前留座，等待恢复参与", None
+    if frame.get("hero_state") == "folded":
+        return None, "本人已弃牌，继续观察本手", None
     seats = frame["seats"]
     timers = {seat["seat"]: _timer(frame, seat["seat"]) for seat in seats}
     deadline = timers.get("hero")
@@ -77,6 +88,7 @@ def _state(frame, model):
         return None, "金额使用缩写，当前读数无法精确核对", deadline
 
     empty = set(model.get("empty_seats", []))
+    inactive = set(frame.get("inactive_seats", ()))
     cardbacks = set(frame.get("cardbacks", []))
     occupied = []
     for seat in seats:
@@ -89,6 +101,10 @@ def _state(frame, model):
         if key in empty or visibly_empty:
             if active or action == "fold":
                 return None, f"{key} 的空席设置与画面冲突", deadline
+            continue
+        if key in inactive:
+            if active or seat["wager"] not in (None, 0):
+                return None, f"{key} 的等待状态与本手参与读数冲突", deadline
             continue
         if action == "fold":
             if key == "hero" or key in cardbacks:
@@ -170,25 +186,26 @@ def _state(frame, model):
 def validate_model(model):
     if not isinstance(model, dict):
         raise ValueError("实时模型应是 JSON 对象")
-    from .layout import SEAT_IDS
+    from .layout import EXTRA_SEAT_IDS, SEAT_IDS
 
+    seat_ids = SEAT_IDS + EXTRA_SEAT_IDS
     allowed = {"empty_seats", "pot_includes_wagers", "ranges", "responses", "aggressive_amount"}
     if model.keys() - allowed:
         raise ValueError("实时模型包含未知配置字段")
     empty = model.get("empty_seats", [])
-    if not isinstance(empty, list) or any(seat not in SEAT_IDS or seat == "hero" for seat in empty):
+    if not isinstance(empty, list) or any(seat not in seat_ids or seat == "hero" for seat in empty):
         raise ValueError("empty_seats 应为除 hero 外的空座位 ID 列表")
     if type(model.get("pot_includes_wagers", False)) is not bool:
         raise ValueError("pot_includes_wagers 应为布尔值")
     if model.get("aggressive_amount") not in (None, "street_total", "additional"):
         raise ValueError("aggressive_amount 应为 street_total 或 additional")
     ranges = model.get("ranges", {})
-    if not isinstance(ranges, dict) or any(seat not in SEAT_IDS or seat == "hero" for seat in ranges):
+    if not isinstance(ranges, dict) or any(seat not in seat_ids or seat == "hero" for seat in ranges):
         raise ValueError("ranges 应为对手座位 ID 到范围的对象")
     responses = model.get("responses", {})
     if not isinstance(responses, dict) or any(
         kind not in _LIVE_ACTIONS or not isinstance(values, dict)
-        or any(seat not in SEAT_IDS or seat == "hero" for seat in values)
+        or any(seat not in seat_ids or seat == "hero" for seat in values)
         for kind, values in responses.items()
     ):
         raise ValueError("responses 应为动作到对手座位应答模型的对象")
@@ -196,43 +213,78 @@ def validate_model(model):
 
 
 class HandTracker:
-    """Tag coherent same-hand frames without inventing boundaries from unknown cards."""
+    """Tag coherent hands using cards or repeated, verified preflop positions."""
 
     def __init__(self):
         self.hand = None
         self.hero = None
         self.board = []
         self.street = None
+        self.dealer = None
+        self.dealer_conflict = False
         self.candidate = None
+
+    @staticmethod
+    def _positions(frame):
+        positions = frame.get("positions") or {}
+        sources = positions.get("sources") or {}
+        dealer = positions.get("dealer_seat") if sources.get("dealer_seat") == "dealer_marker" else None
+        small, big = (positions.get(role) for role in ("small_blind_seat", "big_blind_seat"))
+        blind_sources = {"blind_label", "preflop_order_and_wager"}
+        if (dealer and small and big and small != big and dealer != big
+                and all(sources.get(role) in blind_sources for role in ("small_blind_seat", "big_blind_seat"))):
+            return dealer, (dealer, small, big)
+        return dealer, None
 
     def update(self, frame):
         street = frame["street"]
         cards = frame["hero_cards"]
         board = frame["board"]
+        dealer, positions = self._positions(frame)
+        if dealer and self.dealer and dealer != self.dealer:
+            self.dealer_conflict = True
         if street not in _STREETS:
             self.candidate = None
             return None
         hero = tuple(sorted(cards)) if cards else None
         reset = self.street is not None and _STREETS.index(street) < _STREETS.index(self.street)
-        if hero is None and not (board or (reset and board == [])):
-            self.candidate = None
-            return None
         hero_changed = hero is not None and self.hero is not None and hero != self.hero
         board_conflict = bool(board and board[:len(self.board)] != self.board)
-        if self.hand is None:
-            self.hand = uuid4().hex
-        elif hero_changed or reset or (hero is None and board_conflict):
-            fingerprint = (hero, street, tuple(board or ()))
-            if self.candidate != fingerprint:
-                self.candidate = fingerprint
+        preflop_anchor = positions if street == "preflop" and board == [] else None
+        same_preflop = (street == self.street == "preflop" and board == []
+                        and dealer is not None and dealer == self.dealer)
+        boundary = hero_changed or reset or (hero is None and board_conflict)
+        if self.dealer_conflict:
+            same_cards = ((hero is not None and hero == self.hero)
+                          or (bool(board and self.board) and not board_conflict))
+            evidence_of_change = preflop_anchor or hero_changed or (board and (not self.board or board_conflict))
+            if dealer == self.dealer and same_cards and not boundary:
+                self.dealer_conflict = False
+            elif dealer is None or not evidence_of_change:
+                self.candidate = None
                 return None
+            else:
+                boundary = True
+        if hero is None and not (board or (reset and board == []) or preflop_anchor or same_preflop):
+            self.candidate = None
+            return None
+        if self.hand is None or boundary:
+            if self.hand is not None or (hero is None and not board):
+                fingerprint = (hero, street, tuple(board or ()), dealer, preflop_anchor if hero is None else None)
+                if self.candidate != fingerprint:
+                    self.candidate = fingerprint
+                    return None
             self.hand = uuid4().hex
             self.board = []
             self.hero = None
+            self.dealer = dealer
+            self.dealer_conflict = False
         elif board_conflict:
             self.candidate = None
             return None
         self.candidate = None
+        if self.dealer is None:
+            self.dealer = dealer
         if hero is not None:
             self.hero = hero
         self.street = street
@@ -241,51 +293,125 @@ class HandTracker:
         return self.hand
 
 
+_BOTTOM_SEATS = {"hero", "bottom_center"}
+
+
+def _near_viewport(first, second):
+    # The lower edge of the same window can fluctuate by a few screenshot pixels.
+    if first is None or second is None:
+        return first is second
+    return len(first) == len(second) == 4 and all(abs(a - b) <= 4 for a, b in zip(first, second))
+
+
+def _seat_evidence(frame, previous_seats=()):
+    """Retain top-center evidence, but count the physical bottom seat once."""
+    vacant = set(frame.get("vacant_seats", []))
+    primary = {seat["seat"]: seat for seat in frame["seats"]}
+    seats = primary.copy()
+    for seat in frame.get("popup_seat_candidates", ()):
+        seats.setdefault(seat["seat"], seat)
+    avatars = frame.get("seat_avatars", {})
+
+    bottom = next((seat["seat"] for seat in previous_seats if seat["seat"] in _BOTTOM_SEATS), None)
+    bottom = bottom or next((seat for seat in primary if seat in _BOTTOM_SEATS), None)
+    if bottom is not None:
+        other = next(iter(_BOTTOM_SEATS - {bottom}))
+        if other in primary and bottom not in primary:
+            # A popup can hide evidence that distinguished a spectator from hero.
+            seats[bottom] = {**primary[other], "seat": bottom}
+            if other in vacant:
+                vacant.add(bottom)
+        seats.pop(other, None)
+        avatars = {**avatars, bottom: avatars.get(bottom) or avatars.get(other)}
+
+    rows = [{**seat, "vacant": seat_id in vacant or bool(seat.get("vacant"))}
+            for seat_id, seat in seats.items()]
+    return rows, {seat["seat"]: avatars[seat["seat"]] for seat in rows
+                  if not seat["vacant"] and avatars.get(seat["seat"]) is not None}
+
+
+def _visible_names(seats):
+    return {seat["seat"]: seat["name"] for seat in seats if seat.get("name") and not seat["vacant"]}
+
+
 class PopupTracker:
     """Two readings confirm a visible stable ID before it can change a binding."""
 
     def __init__(self):
         self.reference = None
+        self.popup_reference = None
+        self.popup_viewport = None
+        self.popup_id = None
+        self.in_popup = False
         self.candidate = None
         self.saved = None
 
     def update(self, frame, store, session, now):
-        vacant = set(frame.get("vacant_seats", []))
-        seats = [{**seat, "vacant": seat["seat"] in vacant} for seat in frame["seats"]]
+        viewport = frame.get("viewport")
         if not frame.get("popup_open"):
-            self.reference = (now, frame.get("viewport"), seats)
-            self.candidate = self.saved = None
+            seats, avatars = _seat_evidence(frame)
+            names = _visible_names(seats)
+            repeated = {}
+            if not self.in_popup and self.reference and _near_viewport(self.reference[1], viewport):
+                old_names = _visible_names(self.reference[2])
+                repeated = {seat: name for seat, name in names.items() if old_names.get(seat) == name}
+            self.reference = (now, viewport, seats, avatars, repeated)
+            self.in_popup = False
+            self.popup_reference = self.popup_id = self.candidate = self.saved = None
             return None
+        if not self.in_popup:
+            self.in_popup = True
+            self.popup_viewport = viewport
+            if self.reference and now - self.reference[0] <= 8 and _near_viewport(self.reference[1], viewport):
+                self.popup_reference = self.reference
+        elif not _near_viewport(self.popup_viewport, viewport):
+            self.popup_viewport = viewport
+            self.popup_reference = self.candidate = self.saved = None
         raw = frame.get("player_popup")
         if raw is None:
             self.candidate = None
             return {"type": "waiting", "message": "玩家资料已打开，等待读到唯一 ID"}
         popup = PlayerPopup(**raw)
-        previous = ()
-        if self.reference and now - self.reference[0] <= 5 and self.reference[1] == frame.get("viewport"):
-            previous = self.reference[2]
-        seat = match_popup(popup, seats, previous_seats=previous)
-        key = (popup.player_id, popup.name, seat)
+        if self.popup_id is not None and self.popup_id != popup.player_id:
+            # A new ID without an observed close has no confirmed unobscured reference.
+            self.popup_reference = self.candidate = self.saved = None
+        self.popup_id = popup.player_id
+        previous, previous_avatars, repeated = self.popup_reference[2:] if self.popup_reference else ((), {}, {})
+        seats, avatars = _seat_evidence(frame, previous)
+        avatar_views = {seat: [avatars.get(seat), previous_avatars.get(seat)]
+                        for seat in avatars.keys() | previous_avatars.keys()}
+        seat = match_popup(popup, seats, previous_seats=previous, popup_avatar=frame.get("popup_avatar"),
+                           seat_avatars=avatar_views)
+        key = (popup.player_id, seat)
+        saved_event = self.saved[1] if self.saved else None
+        if seat is None and saved_event and saved_event["type"] == "player_bound":
+            return saved_event
         last = self.candidate
-        self.candidate = (key, popup.stats)
+        self.candidate = (key, popup.stats, popup.name)
         if last is None or last[0] != key:
             return {"type": "waiting", "message": "正在复核弹窗 ID，请保持弹窗片刻"}
 
+        name = popup.name if nickname_key(popup.name) == nickname_key(last[2]) else None
         stats = {name: value for name, value in popup.stats.items() if last[1].get(name) == value}
-        snapshot = (key, stats)
+        snapshot = (key, name, stats)
         if self.saved and self.saved[0] == snapshot:
-            return self.saved[1]
-        event = {"type": "player_profile", "player_id": popup.player_id, "name": popup.name,
+            return saved_event
+        event = {"type": "player_profile", "player_id": popup.player_id, "name": name,
                  "seat": seat, "stats": stats}
         if store is not None and len(stats) == 4:
-            store.save_profile(popup.player_id, name=popup.name, stats=stats)
+            store.save_profile(popup.player_id, name=name, stats=stats)
         if seat is None:
             message = f"已读到 ID {popup.player_id}，座位未能唯一确认"
         elif store is None:
             message = f"已读到 {seat} 的 ID {popup.player_id}"
         else:
+            desk_name = repeated.get(seat)
+            shown_name = _visible_names(seats).get(seat)
+            if shown_name and nickname_key(shown_name) != nickname_key(desk_name):
+                desk_name = None
             try:
-                store.bind(session, seat, popup.player_id, name=popup.name)
+                if not saved_event or saved_event["type"] != "player_bound" or saved_event["seat"] != seat:
+                    store.bind(session, seat, popup.player_id, name=desk_name)
             except ValueError as error:
                 message = f"已读到 ID {popup.player_id}，绑定待处理：{error}"
             else:
@@ -313,53 +439,183 @@ def _emit(event, json_lines):
         print(event["message"], flush=True)
 
 
+def _table_summary(frame, previous, json_lines, hand=None):
+    positions = frame.get("positions", {})
+    if not frame.get("seat_layout_confirmed") and not any(positions.values()):
+        return previous
+    stacks = {seat["seat"]: seat["stack"] for seat in frame["seats"] if seat["stack"] is not None}
+    details = {
+        "seat_capacity": frame.get("seat_capacity"), "spectating": frame["spectating"],
+        "hero_state": frame.get("hero_state"),
+        **{key: value for key, value in positions.items() if key != "sources"},
+        "hand_id": hand, "stacks": stacks,
+    }
+    if hand and previous and previous["hand_id"] == hand and (
+        details.get("dealer_seat") and details.get("dealer_seat") == previous.get("dealer_seat")
+    ):
+        for key in ("small_blind_seat", "big_blind_seat"):
+            if details.get(key) is None:
+                details[key] = previous.get(key)
+    if details == previous:
+        return previous
+    stakes = f"{positions.get('small_blind', '待核对') or '待核对'}/{positions.get('big_blind', '待核对') or '待核对'}"
+    ante = positions.get("ante")
+    message = (f"牌桌 {frame.get('seat_capacity', '?')} 座｜盲注 {stakes}"
+               f"｜ante {ante if ante is not None else '待核对'}"
+               f"｜庄 {positions.get('dealer_seat') or '待核对'}"
+               f"｜小盲位 {details.get('small_blind_seat') or '待核对'}"
+               f"｜大盲位 {details.get('big_blind_seat') or '待核对'}")
+    if stacks:
+        message += "｜余额 " + "、".join(f"{seat} {stack:g}" for seat, stack in stacks.items())
+    _emit({"type": "table", **details, "message": message}, json_lines)
+    return details
+
+
 def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
-              json_lines, database=None, session=None):
-    from .recognition import recognize, screen_image
+              json_lines, database=None, session=None, window_id=None,
+              force_spectator=False, seat_capacity=None, show_actions=False, scan_avatars=False):
+    from .avatar_match import avatars_conflict
+    from .live_actions import ActionLog
+    from .recognition import recognize
 
     model = validate_model(model)
     tracker = HandTracker()
     popups = PopupTracker()
+    actions = ActionLog()
     last_viewport = None
+    table_summary = table_capacity = None
+    portraits = {}
+    scanner = None
+    if scan_avatars:
+        from .avatar_scan import AvatarScanner
+
+        scanner = AvatarScanner()
     context = nullcontext()
     if database is not None:
         from .player_store import PlayerStore
 
         context = PlayerStore(database)
-    source = iter(frames) if frames else iter(screen_image, None)
+    source = iter(frames) if frames else None
+    capture = LiveCapture(window_id, prefer_window=scan_avatars or viewport is None, require_window=scan_avatars)
     previous = None
     last_log_status = None
     with context as store:
         if store is not None:
             _emit({"type": "session", "session": session,
                    "message": f"玩家记录会话 {session}，数据库 {Path(database)}"}, json_lines)
-        for image in source:
+        while True:
             started = monotonic()
             try:
+                if source is None:
+                    image, captured_window = capture.read()
+                    if captured_window != capture.previous_window:
+                        last_viewport = None
+                        tracker = HandTracker()
+                        popups = PopupTracker()
+                        actions = ActionLog()
+                        portraits.clear()
+                        table_summary = table_capacity = None
+                        capture.previous_window = captured_window
+                else:
+                    image, captured_window = next(source), None
                 frame = recognize(image, viewport=viewport, profile=profile,
-                                  auto_viewport=viewport is None, live=True, popup_fallback=last_viewport)
+                                  auto_viewport=viewport is None, live=True, popup_fallback=last_viewport,
+                                  window_capture=captured_window is not None,
+                                  force_spectator=force_spectator, seat_capacity=seat_capacity)
+            except StopIteration:
+                break
             except (OSError, ValueError) as error:
                 event = {"type": "waiting", "message": str(error)}
                 if frames:
                     raise
             else:
+                if captured_window is not None and last_viewport is None and frame.get("viewport"):
+                    width, height = frame["viewport"][2:]
+                    _emit({"type": "viewport", "viewport": frame["viewport"],
+                           "message": f"已定位 WePoker 牌桌 {width}×{height}"}, json_lines)
                 last_viewport = frame.get("viewport") or last_viewport
                 event = popups.update(frame, store, session, monotonic())
+                bindings = store.bindings(session) if store is not None else []
+                if event is not None and event["type"] == "player_bound":
+                    if (portrait := frame.get("popup_avatar")) is not None:
+                        portraits[event["seat"]] = (event["player_id"], portrait)
                 if event is None:
-                    if store is not None and (hand := tracker.update(frame)) is not None:
-                        registered = store.record_frame(session, hand, frame)
-                        paused = tuple(registered.get("paused", []))
+                    capacity = frame.get("seat_capacity") if frame.get("seat_layout_confirmed") else None
+                    table_changed = capacity is not None and table_capacity is not None and capacity != table_capacity
+                    if table_changed:
+                        tracker = HandTracker()
+                        actions = ActionLog()
+                        portraits.clear()
+                    if capacity is not None:
+                        table_capacity = capacity
+                    hand = tracker.update(frame)
+                    if store is not None:
+                        seen = frame.get("seat_avatars", {})
+                        changed = [
+                            binding["seat"] for binding in bindings if not binding["paused"] and (
+                                table_changed or (
+                                    (known := portraits.get(binding["seat"])) is not None
+                                    and known[0] == binding["player_id"] and binding["seat"] in seen
+                                    and avatars_conflict(known[1], seen[binding["seat"]])
+                                )
+                            )
+                        ]
+                        store.reconcile_seats(session, frame, changed_seats=changed)
+                        if hand is not None:
+                            store.record_frame(session, hand, frame)
+                        bindings = store.bindings(session)
+                        paused = tuple(binding["seat"] for binding in bindings if binding["paused"])
                         if paused and paused != last_log_status:
                             _emit({"type": "binding_paused", "seats": paused,
                                    "message": f"需重新确认玩家 ID {'、'.join(paused)}"}, json_lines)
                         last_log_status = paused
+                    if show_actions:
+                        table_summary = _table_summary(frame, table_summary, json_lines, hand)
+                        stacks = {seat["seat"]: seat["stack"] for seat in frame["seats"]}
+                        for action in actions.update(frame, hand, bindings):
+                            if (stack := stacks.get(action["seat"])) is not None:
+                                action["stack"] = stack
+                                action["message"] += f"｜余额 {stack:g}"
+                            _emit(action, json_lines)
                     event = _decision_event(frame, model, samples, previous, started, max_age)
+                if scanner is not None and captured_window is not None:
+                    scan_event = scanner.step(
+                        frame, window_id=captured_window, image_size=image.size,
+                        now=monotonic(), captured_at=started, bindings=bindings,
+                        popup_event=event if frame.get("popup_open") else None,
+                    )
+                    if scan_event:
+                        _emit(scan_event, json_lines)
             key = (event["type"], event.get("fingerprint", event.get("message")))
             if key != previous:
                 _emit({key: value for key, value in event.items() if key != "fingerprint"}, json_lines)
                 previous = key
-            if not frames:
+            if source is None:
                 sleep(max(0.0, interval - (monotonic() - started)))
+
+
+class LiveCapture:
+    def __init__(self, window_id=None, *, prefer_window=True, require_window=False):
+        self.window_id = window_id
+        self.prefer_window = prefer_window and sys.platform == "darwin"
+        self.require_window = require_window
+        self.previous_window = None
+
+    def read(self):
+        from .recognition import screen_image
+        from .window_capture import WindowCaptureError, capture_window, find_wpk_window
+
+        if self.require_window and sys.platform == "win32":
+            from .windows_window import capture_window, find_wpk_window
+
+        window_id = self.window_id
+        if window_id is None and (self.prefer_window or self.require_window):
+            window_id = find_wpk_window()
+            if window_id is None and (self.previous_window is not None or self.require_window):
+                raise WindowCaptureError("等待 WePoker-H5 窗口恢复可见")
+        if window_id is not None:
+            return capture_window(window_id), window_id
+        return screen_image(), None
 
 
 def _decision_event(frame, model, samples, previous, started, max_age):

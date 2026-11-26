@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from deep_stack.ev import analyze
-from deep_stack.live import HandTracker, PopupTracker, _state, scan_live
+from deep_stack.live import HandTracker, LiveCapture, PopupTracker, _state, _table_summary, scan_live
 
 
 _HERO = ["As", "Ks"]
@@ -42,12 +42,51 @@ def frame(*, own_timer=True, passive="跟注 50"):
 
 
 class LiveDecisionTests(unittest.TestCase):
+    def test_waiting_sitting_out_and_folded_hero_cannot_trigger_advice(self):
+        for hero_state, message in (("waiting_for_hand", "等待下一手"), ("sitting_out", "留座"), ("folded", "已弃牌")):
+            with self.subTest(hero_state=hero_state):
+                candidate = frame()
+                candidate["hero_state"] = hero_state
+                state, reason, seconds = _state(candidate, {})
+                self.assertIsNone(state)
+                self.assertIsNone(seconds)
+                self.assertIn(message, reason)
+
+    def test_occupied_waiting_opponent_is_excluded_until_confirmed_active(self):
+        candidate = frame()
+        candidate["seats"].append(seat("left_upper"))
+        candidate["inactive_seats"] = ["left_upper"]
+        state, reason, _ = _state(candidate, {})
+        self.assertIsNone(reason)
+        self.assertEqual([row["seat"] for row in state["seats"]], ["hero", "right_upper"])
+        candidate["cardbacks"] = ["left_upper"]
+        state, reason, _ = _state(candidate, {})
+        self.assertIsNone(state)
+        self.assertIn("等待状态与本手参与读数冲突", reason)
+
     def test_waits_without_hero_timer_even_when_buttons_are_visible(self):
         candidate = frame(own_timer=False)
         state, reason, seconds = _state(candidate, {})
         self.assertIsNone(state)
         self.assertIsNone(seconds)
         self.assertIn("轮到自己", reason)
+
+    def test_reports_new_stacks_and_retains_confirmed_blind_seats_only_for_the_same_hand(self):
+        candidate = frame()
+        candidate.update(seat_capacity=8, seat_layout_confirmed=True, spectating=False)
+        candidate["positions"] = {"dealer_seat": "top_center", "small_blind_seat": "right_upper",
+                                  "big_blind_seat": "right_middle", "small_blind": 5, "big_blind": 10}
+        output = StringIO()
+        with redirect_stdout(output):
+            previous = _table_summary(candidate, None, True, "first")
+            candidate["seats"][0]["stack"] = 390
+            candidate["positions"].update(small_blind_seat=None, big_blind_seat=None)
+            previous = _table_summary(candidate, previous, True, "first")
+            _table_summary(candidate, previous, True, "second")
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[1]["stacks"]["hero"], 390)
+        self.assertEqual(events[1]["small_blind_seat"], "right_upper")
+        self.assertIsNone(events[2]["small_blind_seat"])
 
     def test_waits_if_another_seat_also_has_a_timer(self):
         candidate = frame()
@@ -194,3 +233,138 @@ class PopupTrackerTests(unittest.TestCase):
             self.assertEqual(store.stats("001234")["club_profile"]["pot_entry_rate"], 0.42)
             self.assertEqual(tracker.update(popup_frame, store, "study", 4), event)
             self.assertEqual(len(store.profiles("001234")), 1)
+
+
+class WindowLiveTests(unittest.TestCase):
+    def test_windows_avatar_capture_requires_a_verified_foreground_window(self):
+        from deep_stack.window_capture import WindowCaptureError
+
+        with (
+            patch("deep_stack.live.sys.platform", "win32"),
+            patch("deep_stack.windows_window.find_wpk_window", side_effect=[123, None]),
+            patch("deep_stack.windows_window.capture_window", return_value="client") as read_window,
+            patch("deep_stack.recognition.screen_image") as read_screen,
+        ):
+            capture = LiveCapture(require_window=True)
+            self.assertEqual(capture.read(), ("client", 123))
+            with self.assertRaisesRegex(WindowCaptureError, "等待 WePoker-H5"):
+                capture.read()
+        read_window.assert_called_once_with(123)
+        read_screen.assert_not_called()
+
+    def test_mac_prefers_wpk_and_does_not_switch_to_desktop_if_it_disappears(self):
+        from deep_stack.window_capture import WindowCaptureError
+
+        capture = LiveCapture()
+        capture.prefer_window = True
+        with (
+            patch("deep_stack.window_capture.find_wpk_window", side_effect=[123, None]),
+            patch("deep_stack.window_capture.capture_window", return_value="window") as read_window,
+            patch("deep_stack.recognition.screen_image") as read_screen,
+        ):
+            image, window_id = capture.read()
+            self.assertEqual((image, window_id), ("window", 123))
+            capture.previous_window = window_id
+            with self.assertRaisesRegex(WindowCaptureError, "等待 WePoker-H5"):
+                capture.read()
+        read_window.assert_called_once_with(123)
+        read_screen.assert_not_called()
+
+    def test_temporary_capture_failure_can_recover_in_the_same_session(self):
+        visible = frame(own_timer=False)
+        visible["viewport"] = [0, 242, 3024, 1470]
+        stream = StringIO()
+        with (
+            patch.object(LiveCapture, "read", side_effect=[OSError("临时失败"), ("window", 123), KeyboardInterrupt]),
+            patch("deep_stack.recognition.recognize", return_value=visible) as recognize,
+            patch("deep_stack.live.sleep"),
+            redirect_stdout(stream),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            scan_live(
+                frames=None, viewport=None, profile=None, model={}, samples=100,
+                interval=1, max_age=3, json_lines=True,
+            )
+        self.assertTrue(recognize.call_args.kwargs["window_capture"])
+        events = [json.loads(line) for line in stream.getvalue().splitlines()]
+        self.assertEqual([event["type"] for event in events], ["waiting", "viewport", "waiting"])
+        self.assertEqual(events[1]["viewport"], [0, 242, 3024, 1470])
+
+
+class PopupSeatEvidenceTests(unittest.TestCase):
+    def test_binds_top_center_using_pinned_avatar_when_popup_hides_seat(self):
+        from deep_stack.player_store import PlayerStore
+
+        tracker = PopupTracker()
+        visible = {
+            "seats": [{"seat": "top_center", "name": "样本玩家"}, {"seat": "left_upper", "name": "其他玩家"}],
+            "seat_avatars": {"top_center": (1,), "left_upper": (2,)},
+            "viewport": [0, 242, 1512, 1482],
+        }
+        dialog = {
+            "seats": [{"seat": "top_left", "name": None}, {"seat": "left_upper", "name": "其他玩家"}],
+            "popup_seat_candidates": [{"seat": "top_center", "name": None}],
+            "seat_avatars": {"left_upper": (3,)},
+            "viewport": [0, 242, 1512, 1478],
+            "popup_open": True,
+            "popup_avatar": (1,),
+            "player_popup": {"player_id": "001234", "name": "样本烷家"},
+        }
+        with (
+            TemporaryDirectory() as folder,
+            PlayerStore(Path(folder) / "test.db") as store,
+            patch("deep_stack.player_popup.match_avatar", return_value="top_center") as avatar_match,
+        ):
+            tracker.update(visible, store, "study", 0)
+            tracker.update(visible, store, "study", 1)
+            self.assertEqual(tracker.update(dialog, store, "study", 8)["type"], "waiting")
+            dialog["player_popup"] = {"player_id": "001234", "name": None}
+            event = tracker.update(dialog, store, "study", 10)
+            self.assertEqual((event["type"], event["seat"]), ("player_bound", "top_center"))
+            self.assertEqual(avatar_match.call_args.args[1]["top_center"], [None, (1,)])
+            self.assertEqual(store.bindings("study")[0]["name"], "样本玩家")
+            saved_frame = {**visible, "street": "flop"}
+            self.assertEqual(store.record_frame("study", "hand", saved_frame)["paused"], [])
+
+    def test_rejects_avatar_that_conflicts_with_an_exact_nickname(self):
+        from deep_stack.player_store import PlayerStore
+
+        tracker = PopupTracker()
+        dialog = {
+            "seats": [{"seat": "left_upper", "name": "样本玩家"}, {"seat": "right_upper", "name": "其他玩家"}],
+            "seat_avatars": {"left_upper": (1,), "right_upper": (2,)},
+            "popup_open": True,
+            "popup_avatar": (2,),
+            "player_popup": {"player_id": "001234", "name": "样本玩家"},
+        }
+        with (
+            TemporaryDirectory() as folder,
+            PlayerStore(Path(folder) / "test.db") as store,
+            patch("deep_stack.player_popup.match_avatar", return_value="right_upper"),
+        ):
+            self.assertEqual(tracker.update(dialog, store, "study", 1)["type"], "waiting")
+            event = tracker.update(dialog, store, "study", 2)
+            self.assertEqual((event["type"], event["seat"]), ("player_profile", None))
+            self.assertEqual(store.bindings("study"), [])
+
+    def test_one_physical_bottom_seat_uses_unobscured_spectator_role(self):
+        tracker = PopupTracker()
+        visible = {
+            "seats": [{"seat": "bottom_center", "name": "样本玩家"}, {"seat": "left_upper", "name": None}],
+            "seat_avatars": {"bottom_center": (1,), "left_upper": (2,)},
+        }
+        dialog = {
+            **visible,
+            "seats": [{"seat": "hero", "name": None}, {"seat": "left_upper", "name": None}],
+            "popup_seat_candidates": [{"seat": "bottom_center", "name": None}],
+            "seat_avatars": {"hero": (1,), "left_upper": (2,)},
+            "popup_open": True,
+            "popup_avatar": (1,),
+            "player_popup": {"player_id": "001234", "name": "样本玩家"},
+        }
+        with patch("deep_stack.player_popup.match_avatar", return_value="bottom_center") as avatar_match:
+            tracker.update(visible, None, "study", 1)
+            tracker.update(dialog, None, "study", 2)
+            self.assertEqual(tracker.update(dialog, None, "study", 3)["seat"], "bottom_center")
+            self.assertEqual(avatar_match.call_args.args[1]["bottom_center"], [(1,), (1,)])
+            self.assertNotIn("hero", avatar_match.call_args.args[1])

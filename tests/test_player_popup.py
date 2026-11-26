@@ -150,6 +150,13 @@ class PlayerPopupParsingTests(unittest.TestCase):
 
 
 class PlayerPopupMatchingTests(unittest.TestCase):
+    def test_normalizes_inserted_spacing_but_still_rejects_duplicate_nicknames(self):
+        popup = PlayerPopup("00123", "样 本玩家")
+        rows = [seat("top_center", "样本　玩家"), seat("right_upper", "旁观者")]
+        self.assertEqual(match_popup(popup, rows), "top_center")
+        rows[1]["name"] = "样本玩家"
+        self.assertIsNone(match_popup(popup, rows))
+
     def test_uses_current_or_adjacent_visible_name_only(self):
         popup = PlayerPopup("00123", "Example")
         first = [seat("top_left", "Ｅxample"), seat("right_upper", "Someone else")]

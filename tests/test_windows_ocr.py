@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from deep_stack.layout import default_profile, pixel_regions
-from deep_stack.windows_ocr import WindowsOCRError, _generic_suit, read_fields
+from deep_stack.windows_ocr import WindowsOCRError, _generic_suit, _match_suit, read_fields
 
 
 _HAS_OCR = all(find_spec(name) is not None for name in ("rapidocr", "onnxruntime", "PIL"))
@@ -111,6 +111,16 @@ class PortableOCRTests(unittest.TestCase):
                 cards = {key: value for key, value in fields.items() if "_card_" in key}
                 self.assertEqual(table["hero_cards"], ["As", "Kh"], cards)
                 self.assertEqual(table["board"], ["7d", "2c", "Qc"], cards)
+
+    def test_dimmed_red_diamond_is_not_counted_as_black_ink(self):
+        from PIL import Image
+
+        image = Image.new("RGB", (40, 44), "white")
+        mask = _generic_suit("d", (22, 22))
+        image.paste("#661421", (9, 11), mask)
+        match = _match_suit(image)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[0], "d")
 
     def test_reads_chinese_with_cpu_model(self):
         from deep_stack.recognition import _table_state

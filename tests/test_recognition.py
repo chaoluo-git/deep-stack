@@ -22,6 +22,79 @@ def by_seat(result, seat):
 
 
 class TableRecognitionTests(unittest.TestCase):
+    def test_reads_eight_seat_spectator_table_without_assigning_a_hero(self):
+        result = _table_state({
+            "top_center.label": observations("Top Player"),
+            "top_center.stack": observations("800"),
+            "right_upper.label": observations("Right Player"),
+            "right_upper.stack": observations("500"),
+            "hero.label": observations("Bottom Player"),
+            "bottom_center.label": observations("Bottom Player"),
+            "bottom_center.stack": observations("420"),
+            "bottom_center.wager": observations("50"),
+        })
+        self.assertTrue(result["spectating"])
+        self.assertIsNone(result["hero_cards"])
+        self.assertEqual(len(result["seats"]), 8)
+        self.assertEqual(by_seat(result, "top_center")["name"], "Top Player")
+        self.assertEqual(by_seat(result, "bottom_center"), {
+            "seat": "bottom_center", "name": "Bottom Player", "stack": 420, "action": None, "wager": 50,
+        })
+        self.assertTrue({"hero", "top_left", "top_right"}.isdisjoint(seat["seat"] for seat in result["seats"]))
+        self.assertFalse(any("手牌无法" in warning for warning in result["warnings"]))
+
+    def test_keeps_existing_seats_when_alternate_regions_overlap_own_hand(self):
+        result = _table_state({
+            "top_right.stack": observations("750"),
+            "top_center.label": observations("Centered"),
+            "top_center.stack": observations("800"),
+            "bottom_center.label": observations("Bottom"),
+            "bottom_center.stack": observations("420"),
+            "spectator_hint_left": observations("偷偷看牌"),
+            "hero_card_0": observations("As"),
+            "hero_card_1": observations("Kh"),
+        })
+        self.assertFalse(result["spectating"])
+        self.assertEqual(result["hero_cards"], ["As", "Kh"])
+        self.assertEqual(len(result["seats"]), 9)
+        self.assertTrue({"top_center", "bottom_center"}.isdisjoint(seat["seat"] for seat in result["seats"]))
+
+    def test_reads_spectator_hint_when_bottom_seat_has_no_amount(self):
+        fields = {"spectator_hint_right": observations("發發看"), "bottom_center.label": observations("坐下")}
+        result = _table_state(fields)
+        self.assertTrue(result["spectating"])
+        self.assertEqual(result["vacant_seats"], ["bottom_center"])
+        fields["hero.stack"] = observations("0")
+        result = _table_state(fields)
+        self.assertFalse(result["spectating"])
+        self.assertEqual(by_seat(result, "hero")["stack"], 0)
+
+    def test_waiting_banner_preserves_hero_and_idle_stack(self):
+        result = _table_state({
+            "top_center.label": observations("Top Player"), "top_center.stack": observations("800"),
+            "right_upper.label": observations("Right"), "right_upper.stack": observations("600"),
+            "bottom_center.label": observations("Hero"), "bottom_center.stack": observations("420"),
+            "hero.avatar": observations("等待中"), "hero_waiting_banner": observations("等待下一手"),
+        })
+        self.assertFalse(result["spectating"])
+        self.assertTrue(result["hero_evidence"])
+        self.assertEqual(result["hero_state"], "waiting_for_hand")
+        self.assertEqual(result["inactive_seats"], ["hero"])
+        self.assertNotIn("hero", result["vacant_seats"])
+        self.assertEqual(by_seat(result, "hero")["stack"], 420)
+        self.assertIsNone(result["hero_cards"])
+
+    def test_waiting_opponent_remains_occupied(self):
+        result = _table_state({
+            "left_upper.label": observations("Someone"), "left_upper.stack": observations("180"),
+            "left_upper.avatar": observations("等待中"),
+            "hero_card_0": observations("As"), "hero_card_1": observations("Kd"),
+        })
+        self.assertEqual(result["hero_state"], "playing")
+        self.assertEqual(result["inactive_seats"], ["left_upper"])
+        self.assertNotIn("left_upper", result["vacant_seats"])
+        self.assertEqual(by_seat(result, "left_upper")["name"], "Someone")
+
     def test_extracts_visible_fields_and_leaves_hidden_names_unknown(self):
         result = _table_state({
             "top_left.label": observations("让牌"),
@@ -106,6 +179,23 @@ class TableRecognitionTests(unittest.TestCase):
         })
         self.assertEqual(result["street"], "flop")
         self.assertIsNone(result["board"])
+
+    def test_empty_top_center_can_define_an_eight_seat_spectator_table(self):
+        result = _table_state({}, vacancy_markers=["top_center", "left_upper"], force_spectator=True)
+        seats = {seat["seat"] for seat in result["seats"]}
+        self.assertTrue(result["seat_layout_confirmed"])
+        self.assertEqual(result["seat_capacity"], 8)
+        self.assertEqual(set(result["vacant_seats"]), {"top_center", "left_upper"})
+        self.assertIn("bottom_center", seats)
+        self.assertNotIn("hero", seats)
+        self.assertIsNone(result["hero_cards"])
+
+    def test_empty_upper_side_preserves_nine_seat_layout(self):
+        result = _table_state({}, vacancy_markers=["top_left", "left_upper"], force_spectator=True)
+        self.assertTrue(result["seat_layout_confirmed"])
+        self.assertEqual(result["seat_capacity"], 9)
+        self.assertIn("top_left", result["vacant_seats"])
+        self.assertNotIn("hero", {seat["seat"] for seat in result["seats"]})
 
     def test_conflicting_symbol_and_ocr_card_remains_unknown(self):
         conflicting = observations("Ah", card_surface=True)

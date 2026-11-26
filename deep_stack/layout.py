@@ -12,6 +12,17 @@ _REFERENCE_WIDTH = 3024
 _REFERENCE_HEIGHT = 1470
 _REFERENCE_TOP = 242
 _REFERENCE_RATIO = _REFERENCE_WIDTH / _REFERENCE_HEIGHT
+_NARROW_HEIGHT = 1482
+_NARROW_RATIO = 1512 / _NARROW_HEIGHT
+_CALIBRATION_MARGIN = 0.03
+
+# Wide and split-screen seat centers at the two measured sizes. The last
+# value assigns small changes beyond either measured edge to the near side.
+_HORIZONTAL_ANCHORS = {
+    "left": (314, 182, 0.0),
+    "center": (1512, 756, 0.5),
+    "right": (2708, 1330, 1.0),
+}
 
 # Seat ID, horizontal center, and vertical centers in the reference screenshot.
 _SEATS = (
@@ -26,9 +37,11 @@ _SEATS = (
     ("left_upper", 314, 459, 528, 603, (422, 528)),
 )
 SEAT_IDS = tuple(seat[0] for seat in _SEATS)
+EXTRA_SEAT_IDS = ("top_center", "bottom_center")
 HERO_CARD_FIELDS = ("hero_card_0", "hero_card_1")
 BOARD_CARD_FIELDS = tuple(f"board_card_{index}" for index in range(5))
 HERO_BUTTON_FIELDS = ("hero_fold_button", "hero_passive_button", "hero_aggressive_button")
+SPECTATOR_FIELDS = ("spectator_hint_left", "spectator_hint_right")
 POPUP_TEXT_FIELDS = ("player_popup", "player_popup_id", "player_popup_id_label", "player_popup_name")
 POPUP_NUMBER_FIELDS = (
     "player_popup_id_value", "player_popup_hands", "player_popup_win_rate",
@@ -36,14 +49,17 @@ POPUP_NUMBER_FIELDS = (
 )
 
 _REGION_KINDS = {
-    **{f"{seat}.{field}": kind for seat in SEAT_IDS for field, kind in (
+    **{f"{seat}.{field}": kind for seat in SEAT_IDS + EXTRA_SEAT_IDS for field, kind in (
         ("label", "label"), ("avatar", "label"), ("stack", "number"), ("wager", "number"),
-        ("status", "label"), ("cardback", "marker"),
+        ("status", "label"), ("cardback", "marker"), ("portrait", "marker"),
+        ("dealer_left", "label"), ("dealer_right", "label"), ("blind_label", "label"),
     )},
     **dict.fromkeys(("pot", "center_pot"), "number"),
     **dict.fromkeys(HERO_CARD_FIELDS + BOARD_CARD_FIELDS, "card"),
-    **dict.fromkeys(HERO_BUTTON_FIELDS + POPUP_TEXT_FIELDS, "label"),
+    **dict.fromkeys(HERO_BUTTON_FIELDS + SPECTATOR_FIELDS + POPUP_TEXT_FIELDS + ("hero_waiting_banner",), "label"),
     **dict.fromkeys(POPUP_NUMBER_FIELDS, "number"),
+    **dict.fromkeys(("player_popup_portrait", "player_popup_panel"), "marker"),
+    "table_stakes": "label",
 }
 _COORDINATES = ("x", "y", "width", "height")
 
@@ -193,6 +209,36 @@ def pixel_regions(profile: LayoutProfile, viewport: tuple[int, int, int, int]) -
     return regions
 
 
+def responsive_profile(profile: LayoutProfile, viewport: tuple[int, int, int, int]) -> LayoutProfile | None:
+    """Project the built-in wide layout onto a measured desktop table size."""
+    _, _, width, height = validate_viewport(viewport)
+    ratio = width / height
+    if profile.reference_aspect_ratio != _REFERENCE_RATIO or not (
+        _NARROW_RATIO * (1 - _CALIBRATION_MARGIN) <= ratio <= _REFERENCE_RATIO * (1 + _CALIBRATION_MARGIN)
+    ):
+        return None
+    if ratio == _REFERENCE_RATIO:
+        return profile
+
+    measured = min(_REFERENCE_RATIO, max(_NARROW_RATIO, ratio))
+    wide_share = (measured - _NARROW_RATIO) / (_REFERENCE_RATIO - _NARROW_RATIO)
+    regions = {}
+    for key, bounds in profile.regions.items():
+        side = key.split("_", 1)[0]
+        wide_x, narrow_x, edge = _HORIZONTAL_ANCHORS.get(side, _HORIZONTAL_ANCHORS["center"])
+        reference_anchor = wide_x / _REFERENCE_HEIGHT
+        anchor = narrow_x / _NARROW_HEIGHT * (1 - wide_share) + reference_anchor * wide_share
+        anchor += (ratio - measured) * edge
+        # Keep the card and text crops proportional to table height. Relocate
+        # their seat group instead of compressing them into the smaller width.
+        x = (anchor + bounds["x"] * _REFERENCE_RATIO - reference_anchor) / ratio
+        right = min(1.0, x + bounds["width"] * _REFERENCE_RATIO / ratio)
+        x = max(0.0, x)
+        if right > x:
+            regions[key] = {**bounds, "x": x, "width": right - x}
+    return LayoutProfile(regions, ratio)
+
+
 def layout_warnings(profile: LayoutProfile, viewport: tuple[int, int, int, int]) -> list[str]:
     """Warn when a resize may have changed the game's responsive layout."""
     _, _, width, height = validate_viewport(viewport)
@@ -289,12 +335,34 @@ def _window_bottom(image, left: int, top: int, right: int, felt_bottom: int) -> 
     return height if limit == height else None
 
 
-def detect_viewport(image) -> tuple[int, int, int, int] | None:
+def detect_viewport(image, *, window: bool = False) -> tuple[int, int, int, int] | None:
     """Find one coherent green table including its bottom control area.
 
-    The input is a Pillow image. For multiple tables, unclear edges, or a
-    large overlay, return None and use a manually selected viewport.
+    A single-window capture supplies the lower boundary directly. Its alpha
+    channel may contain a translucent window shadow, which is outside the
+    browser. Coordinates are always relative to the original Pillow image.
     """
+    if not window:
+        return _detect_viewport(image, window=False)
+
+    left, top = 0, 0
+    if "A" in image.getbands():
+        opaque = image.getchannel("A").point(lambda alpha: 255 if alpha >= 248 else 0)
+        bounds = opaque.getbbox()
+        if bounds is None:
+            return None
+        left, top, _, _ = bounds
+        if bounds != (0, 0, *image.size):
+            image = image.crop(bounds)
+
+    viewport = _detect_viewport(image, window=True)
+    if viewport is None:
+        return None
+    x, y, width, height = viewport
+    return left + x, top + y, width, height
+
+
+def _detect_viewport(image, *, window: bool) -> tuple[int, int, int, int] | None:
     width, height = image.size
     if width < 100 or height < 80:
         return None
@@ -328,12 +396,27 @@ def detect_viewport(image) -> tuple[int, int, int, int] | None:
     region_columns = _step_samples(left, right, 50)
     top = next((y for y in near(top, step_y, height)
                 if sum(_felt(pixels[x, y]) for x in region_columns) >= 40), None)
-    center_columns = _step_samples(left + (right - left) * 2 // 5, left + (right - left) * 3 // 5, 30)
-    felt_edge = next((y for y in reversed(near(bottom, step_y, height))
-                      if sum(_felt(pixels[x, y]) for x in center_columns) >= 24), None)
-    if top is None or felt_edge is None or felt_edge - top < 60:
+    if top is None:
         return None
-    bottom = _window_bottom(image, left, top, right, felt_edge + 1)
-    if bottom is None:
-        return None
+    if window:
+        # Curved table edges can lose most green columns near the lowest point.
+        # Look up into the last sixth of the window's content, which bounds the
+        # non-green footer to one fifth of the felt height.
+        first_row = max(top + 60, (5 * height + top + 5) // 6 - 1)
+        last_row = min(height - 1, math.ceil(bottom) + 2 * step_y)
+        if not any(
+            sum(_felt(pixels[x, y]) for x in region_columns) >= 16
+            for y in range(last_row, first_row - 1, -1)
+        ):
+            return None
+        bottom = height
+    else:
+        center_columns = _step_samples(left + (right - left) * 2 // 5, left + (right - left) * 3 // 5, 30)
+        felt_edge = next((y for y in reversed(near(bottom, step_y, height))
+                          if sum(_felt(pixels[x, y]) for x in center_columns) >= 24), None)
+        if felt_edge is None or felt_edge - top < 60:
+            return None
+        bottom = _window_bottom(image, left, top, right, felt_edge + 1)
+        if bottom is None:
+            return None
     return left, top, right - left, bottom - top
