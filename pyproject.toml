@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-stack-table"
+version = "0.2.0"
+description = "Local hold'em table observation and conditional chip EV"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+live = ["Pillow==13.0.0"]
+ocr = ["Pillow==13.0.0", "rapidocr==3.10.0", "onnxruntime==1.32.0"]
+windows = ["Pillow==13.0.0", "rapidocr==3.10.0", "onnxruntime==1.32.0"]
+
+[project.scripts]
+deep-stack = "deep_stack.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["deep_stack*"]
+
+[tool.setuptools.package-data]
+deep_stack = ["ocr.swift"]

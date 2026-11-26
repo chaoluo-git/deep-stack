@@ -1,0 +1,70 @@
+name: Test and build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-2025
+            arch: x64
+            artifact: deep-stack-windows-x64
+            artifact_path: dist/deep-stack/
+          - name: macOS arm64
+            runner: macos-26
+            arch: arm64
+            artifact: deep-stack-macos-arm64
+            artifact_path: dist/deep-stack-macos-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+      - name: Install OCR and build dependencies
+        run: python -m pip install ".[ocr]" "pyinstaller==6.22.3"
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Bundle the application
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onedir --name deep-stack
+          --paths . --collect-all rapidocr --collect-all onnxruntime
+          --recursive-copy-metadata rapidocr --recursive-copy-metadata onnxruntime
+          --copy-metadata pillow
+          scripts/frozen_entry.py
+      - name: Include usage instructions and runtime license
+        run: python scripts/prepare_bundle.py dist/deep-stack
+      - name: Verify Windows executable
+        if: runner.os == 'Windows'
+        run: python scripts/frozen_smoke.py dist/deep-stack/deep-stack.exe
+      - name: Archive and verify macOS executable
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          COPYFILE_DISABLE=1 tar -czf dist/deep-stack-macos-arm64.tar.gz -C dist deep-stack
+          staging="$(mktemp -d)"
+          tar -xzf dist/deep-stack-macos-arm64.tar.gz -C "$staging"
+          python scripts/frozen_smoke.py "$staging/deep-stack/deep-stack"
+      - name: Upload standalone package
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
