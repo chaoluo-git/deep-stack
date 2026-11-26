@@ -2,6 +2,7 @@
 
 from math import isfinite
 
+from .layout import SEAT_LABELS
 from .observations import STREETS
 from .player_store import _name_key
 
@@ -23,7 +24,7 @@ class ActionLog:
         self._unknown_amounts = {}
         self._terminal_streets = {}
 
-    def update(self, frame, hand_id, bindings):
+    def update(self, frame, hand_id, bindings, *, positions=None):
         street = frame.get("street")
         if frame.get("popup_open"):
             return []
@@ -76,12 +77,16 @@ class ActionLog:
             if binding and name and binding.get("name") and _name_key(name) != _name_key(binding["name"]):
                 binding = None
             player_id = binding["player_id"] if binding else None
-            events.append(_action_event(street, seat, action, wager, hand_id, player_id, wager_update))
+            position = positions.get(seat) if positions is not None else None
+            events.append(_action_event(street, seat, action, wager, hand_id, player_id, wager_update, position))
         return events
 
 
-def _action_event(street, seat, action, wager, hand_id, player_id, wager_update):
-    identity = f"{seat} ID {player_id}" if player_id is not None else seat
+def _action_event(street, seat, action, wager, hand_id, player_id, wager_update, position):
+    seat_label = SEAT_LABELS.get(seat, seat)
+    identity = f"{position} · {seat_label}" if position else seat_label
+    if player_id is not None:
+        identity += f" ID {player_id}"
     amount = f"，可见金额 {wager:g}" if wager is not None else ""
     pending = "（手牌待确认）" if hand_id is None else ""
     label = _ACTION_LABELS[action]
@@ -91,6 +96,8 @@ def _action_event(street, seat, action, wager, hand_id, player_id, wager_update)
         "type": "action",
         "street": street,
         "seat": seat,
+        "seat_label": seat_label,
+        "position": position,
         "action": action,
         "wager": wager,
         "hand_id": hand_id,

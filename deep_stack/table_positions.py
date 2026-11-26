@@ -5,7 +5,7 @@ import unicodedata
 from decimal import Decimal
 from math import isfinite
 
-from .layout import SEAT_IDS
+from .layout import clockwise_seats
 
 
 _NUMBER = r"[0-9]{1,9}(?:\.[0-9]{1,4})?"
@@ -53,15 +53,6 @@ def _stakes(fields):
     return small, big, next(iter(antes)) if len(antes) == 1 else None
 
 
-def _clockwise(known):
-    seats = SEAT_IDS
-    if "top_center" in known:
-        seats = ("top_center", *seats[2:])
-    if "bottom_center" in known:
-        seats = tuple("bottom_center" if seat == "hero" else seat for seat in seats)
-    return seats if set(seats) == known else None
-
-
 def _amount_matches(value, expected):
     return type(value) in (int, float) and isfinite(value) and Decimal(str(value)) == expected
 
@@ -69,7 +60,7 @@ def _amount_matches(value, expected):
 def _infer_blinds(rows, vacant, inactive, dealer, small, big):
     if dealer is None or small is None or big is None:
         return None
-    order = _clockwise(rows.keys() | vacant)
+    order = clockwise_seats(rows.keys() | vacant)
     if order is None:
         return None
     occupied = []
@@ -93,7 +84,7 @@ def _infer_blinds(rows, vacant, inactive, dealer, small, big):
     small_offset, big_offset = (0, 1) if len(occupied) == 2 else (1, 2)
     small_seat = occupied[(index + small_offset) % len(occupied)]
     big_seat = occupied[(index + big_offset) % len(occupied)]
-    if any(rows[seat].get("action") is not None for seat in (small_seat, big_seat)):
+    if rows[small_seat].get("action") not in (None, "fold") or rows[big_seat].get("action") not in (None, "fold", "check"):
         return None
     if not _amount_matches(rows[small_seat].get("wager"), small):
         return None
@@ -108,7 +99,7 @@ def _number(value):
     return int(value) if value == value.to_integral_value() else float(value)
 
 
-def read_table_positions(fields, seats, vacant_seats, street, *, inactive_seats=()):
+def read_table_positions(fields, seats, vacant_seats, street, *, inactive_seats=(), conflicting_seats=()):
     """Return only visible roles, or corroborated preflop seat-order inference."""
     rows = {row["seat"]: row for row in seats}
     vacant = set(vacant_seats)
@@ -138,7 +129,8 @@ def read_table_positions(fields, seats, vacant_seats, street, *, inactive_seats=
         if len(candidates) == 1:
             positions[key] = next(iter(candidates))
             sources[key] = "blind_label"
-    if street == "preflop" and len(rows) == len(seats) and all(len(candidates) <= 1 for candidates in labels.values()):
+    if (street == "preflop" and not conflicting_seats and len(rows) == len(seats)
+            and all(len(candidates) <= 1 for candidates in labels.values())):
         inferred = _infer_blinds(rows, vacant, inactive, dealer, small, big)
         if inferred and all(not labels[key] or seat in labels[key] for key, seat in zip(labels, inferred)):
             for key, seat in zip(labels, inferred):

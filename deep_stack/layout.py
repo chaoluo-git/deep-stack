@@ -38,6 +38,12 @@ _SEATS = (
 )
 SEAT_IDS = tuple(seat[0] for seat in _SEATS)
 EXTRA_SEAT_IDS = ("top_center", "bottom_center")
+SEAT_LABELS = {
+    "top_left": "上左", "top_center": "上中", "top_right": "上右",
+    "right_upper": "右上", "right_middle": "右中", "right_lower": "右下",
+    "hero": "底中（本人）", "bottom_center": "底中", "left_lower": "左下",
+    "left_middle": "左中", "left_upper": "左上",
+}
 HERO_CARD_FIELDS = ("hero_card_0", "hero_card_1")
 BOARD_CARD_FIELDS = tuple(f"board_card_{index}" for index in range(5))
 HERO_BUTTON_FIELDS = ("hero_fold_button", "hero_passive_button", "hero_aggressive_button")
@@ -62,6 +68,16 @@ _REGION_KINDS = {
     "table_stakes": "label",
 }
 _COORDINATES = ("x", "y", "width", "height")
+
+
+def clockwise_seats(known):
+    """Return the clockwise physical order of a complete supported seat layout."""
+    seats = SEAT_IDS
+    if "top_center" in known:
+        seats = ("top_center", *seats[2:])
+    if "bottom_center" in known:
+        seats = tuple("bottom_center" if seat == "hero" else seat for seat in seats)
+    return seats if set(seats) == set(known) else None
 
 
 @dataclass(frozen=True)

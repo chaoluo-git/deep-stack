@@ -5,8 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from deep_stack.recognition import RecognitionError, _table_state, recognize
+from deep_stack.recognition import RecognitionError, _table_state, live_profile, recognize
 
 
 def observations(*texts, confidence=0.99, empty_felt=False, card_surface=False):
@@ -22,6 +23,11 @@ def by_seat(result, seat):
 
 
 class TableRecognitionTests(unittest.TestCase):
+    def test_spectator_and_hero_share_the_bottom_dealer_marker(self):
+        regions = live_profile().regions
+        for side in ("left", "right"):
+            self.assertEqual(regions[f"hero.dealer_{side}"], regions[f"bottom_center.dealer_{side}"])
+
     def test_reads_eight_seat_spectator_table_without_assigning_a_hero(self):
         result = _table_state({
             "top_center.label": observations("Top Player"),
@@ -196,6 +202,78 @@ class TableRecognitionTests(unittest.TestCase):
         self.assertEqual(result["seat_capacity"], 9)
         self.assertIn("top_left", result["vacant_seats"])
         self.assertNotIn("hero", {seat["seat"] for seat in result["seats"]})
+
+    def test_uses_a_visible_empty_bottom_seat_as_spectator_evidence(self):
+        fields = {
+            "top_right.label": observations("One"), "top_right.stack": observations("800"),
+            "left_upper.label": observations("Two"), "left_upper.stack": observations("600"),
+        }
+        result = _table_state(fields, vacancy_markers=["hero", "bottom_center"])
+        self.assertTrue(result["spectating"])
+        self.assertEqual(result["seat_status"]["bottom_center"], "vacant")
+        self.assertNotIn("hero", result["seat_status"])
+
+        fields["hero_waiting_banner"] = observations("等待下一手")
+        result = _table_state(fields, vacancy_markers=["hero", "bottom_center"])
+        self.assertFalse(result["spectating"])
+        self.assertEqual(result["hero_state"], "waiting_for_hand")
+        self.assertEqual(result["seat_status"]["hero"], "conflict")
+
+    def test_live_empty_crosses_in_the_upper_and_bottom_seats(self):
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError:
+            self.skipTest("Pillow is required for the visual vacancy fixture")
+        from deep_stack.layout import pixel_regions
+
+        viewport = (0, 0, 1512, 735)
+        image = Image.new("RGB", viewport[2:], (22, 108, 68))
+        draw = ImageDraw.Draw(image)
+        bounds = pixel_regions(live_profile(), viewport)
+        for seat in ("top_left", "bottom_center"):
+            x, y, w, h = bounds[f"{seat}.avatar"]
+            cx, cy = x + w // 2, y + h // 2
+            draw.line((cx - w // 5, cy, cx + w // 5, cy), fill=(148, 152, 148), width=2)
+            draw.line((cx, cy - h * 2 // 5, cx, cy + h * 2 // 5), fill=(148, 152, 148), width=2)
+        fields = {
+            "top_right.label": observations("One"), "top_right.stack": observations("800"),
+            "left_upper.label": observations("Two"), "left_upper.stack": observations("600"),
+        }
+        with patch("deep_stack.recognition._fields", return_value=fields):
+            frame = recognize(image, viewport=viewport, live=True)
+        self.assertTrue(frame["spectating"])
+        self.assertEqual(frame["vacant_seats"], ["top_left", "bottom_center"])
+        self.assertEqual(frame["seat_status"]["right_upper"], "unknown")
+
+    def test_distinguishes_empty_avatar_text_inactive_players_and_missing_reads(self):
+        result = _table_state({
+            "right_upper.avatar": observations("點擊入座"),
+            "right_middle.avatar": observations("等待加入"),
+            "right_middle.stack": observations("420"),
+            "right_lower.status": observations("离座"),
+            "left_upper.label": observations("空座", confidence=0.64),
+            "left_lower.avatar": observations("弃牌"),
+            "top_right.stack": observations("800"),
+        }, seat_capacity=9)
+        self.assertEqual(result["vacant_seats"], ["right_upper"])
+        self.assertEqual(result["inactive_seats"], ["right_middle", "right_lower"])
+        self.assertEqual(result["seat_status"]["left_upper"], "unknown")
+        self.assertEqual(result["seat_status"]["left_middle"], "unknown")
+        self.assertEqual(result["seat_status"]["left_lower"], "occupied")
+        self.assertEqual(result["seat_status"]["top_right"], "occupied")
+
+    def test_conflicting_evidence_does_not_remove_a_possibly_occupied_seat(self):
+        result = _table_state({
+            "right_upper.label": observations("One"),
+            "right_upper.stack": observations("600"),
+            "right_middle.avatar": observations("空位"),
+            "right_lower.status": observations("暂离"),
+            "right_lower.label": observations("弃牌"),
+        }, vacancy_markers=["right_upper"], occupied_markers=["right_middle"], seat_capacity=9)
+        self.assertEqual(result["vacant_seats"], [])
+        self.assertEqual(result["inactive_seats"], [])
+        for seat in ("right_upper", "right_middle", "right_lower"):
+            self.assertEqual(result["seat_status"][seat], "conflict")
 
     def test_conflicting_symbol_and_ocr_card_remains_unknown(self):
         conflicting = observations("Ah", card_surface=True)

@@ -2,8 +2,9 @@
 
 from importlib.util import find_spec
 import unittest
+from unittest.mock import patch
 
-from deep_stack.player_popup import PlayerPopup, match_popup, parse_popup
+from deep_stack.player_popup import PlayerPopup, match_popup, parse_popup, resolve_popup_seat
 
 
 POPUP_VIEWPORT = (0, 0, 1512, 735)
@@ -150,6 +151,26 @@ class PlayerPopupParsingTests(unittest.TestCase):
 
 
 class PlayerPopupMatchingTests(unittest.TestCase):
+    def test_describes_the_evidence_that_prevents_a_safe_match(self):
+        popup = PlayerPopup("00123", "Example")
+
+        def resolve(rows, previous=()):
+            return resolve_popup_seat(popup, rows, previous_seats=previous)
+
+        previous = [seat("top_center", "Example")]
+        self.assertEqual(resolve([seat("top_center", "Other")]), (None, "no_matching_seat"))
+        self.assertEqual(resolve([seat("top_center", "Other")], previous), (None, "nickname_changed"))
+        self.assertEqual(resolve([seat("top_center", None, vacant=True)], previous), (None, "seat_unavailable"))
+        matching = [seat("top_center", "Example"), seat("right_upper", "Example")]
+        self.assertEqual(resolve(matching), (None, "duplicate_nickname"))
+        self.assertEqual(resolve_popup_seat(PlayerPopup("00123"), matching),
+                         (None, "popup_nickname_unavailable"))
+
+        with patch("deep_stack.player_popup.match_avatar", return_value="right_upper"):
+            other = [seat("top_center", "Example"), seat("right_upper", "Other")]
+            self.assertEqual(resolve(other), (None, "avatar_nickname_conflict"))
+            self.assertEqual(resolve(matching), ("right_upper", None))
+
     def test_normalizes_inserted_spacing_but_still_rejects_duplicate_nicknames(self):
         popup = PlayerPopup("00123", "样 本玩家")
         rows = [seat("top_center", "样本　玩家"), seat("right_upper", "旁观者")]
@@ -179,6 +200,27 @@ class PlayerPopupMatchingTests(unittest.TestCase):
         ):
             with self.subTest(current=current):
                 self.assertIsNone(match_popup(popup, current, previous_seats=previous))
+
+
+class PopupSeatDiagnosticTests(unittest.TestCase):
+    def test_tracker_keeps_the_profile_unbound_and_reports_the_missing_evidence(self):
+        from deep_stack.live import PopupTracker
+
+        tracker = PopupTracker()
+        profile = {"player_id": "00123", "name": "Profile"}
+        frame = {"popup_open": True, "player_popup": profile,
+                 "seats": [seat("left_upper", None), seat("right_upper", "Other")]}
+        self.assertEqual(tracker.update(frame, None, "test", 1)["type"], "waiting")
+        event = tracker.update(frame, None, "test", 2)
+        self.assertEqual((event["type"], event["seat"], event["seat_match_reason"]),
+                         ("player_profile", None, "no_matching_seat"))
+        self.assertIn("再打开同一头像", event["message"])
+        self.assertEqual(tracker.update(frame, None, "test", 3), event)
+
+        changed = {**frame, "player_popup": {**profile, "name": None}}
+        self.assertEqual(tracker.update(changed, None, "test", 4)["seat_match_reason"], "evidence_varies")
+        self.assertEqual(tracker.update(changed, None, "test", 5)["seat_match_reason"],
+                         "popup_nickname_unavailable")
 
 
 if __name__ == "__main__":

@@ -90,7 +90,7 @@ def _parser():
     live.add_argument("--spectate", action="store_true", help="观战模式，底部座位视为普通玩家")
     live.add_argument("--table-seats", type=int, choices=(8, 9), help="指定实体座位数量，默认自动判断")
     live.add_argument("--scan-avatars", action="store_true", help="macOS 或 Windows 观战时依次打开未绑定玩家的头像")
-    live.add_argument("--quiet-actions", action="store_true", help="只隐藏终端的动作和牌桌摘要")
+    live.add_argument("--quiet-actions", action="store_true", help="隐藏动作和牌桌摘要，仍显示公共牌")
     live_log = live.add_mutually_exclusive_group()
     live_log.add_argument("--db", type=Path, help="本地玩家 SQLite 路径")
     live_log.add_argument("--no-player-log", action="store_true", help="关闭玩家动作归档")
@@ -246,7 +246,7 @@ def _run(args):
                   samples=args.samples, interval=args.interval, max_age=args.max_age,
                   json_lines=args.json, database=db, session=args.session or uuid4().hex[:12],
                   window_id=args.window_id, force_spectator=args.spectate, seat_capacity=args.table_seats,
-                  show_actions=not args.quiet_actions, scan_avatars=args.scan_avatars)
+                  show_actions=not args.quiet_actions, show_board=True, scan_avatars=args.scan_avatars)
         return None
     if args.command == "layout-template":
         from .layout import profile_template

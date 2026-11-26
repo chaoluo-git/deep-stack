@@ -84,6 +84,17 @@ class TablePositionTests(unittest.TestCase):
                                       rows, vacant, "preflop")
         self.assertEqual((result["small_blind_seat"], result["big_blind_seat"]), ("right_upper", "left_lower"))
 
+    def test_can_read_matching_posted_blinds_after_both_players_fold(self):
+        rows, vacant = table({"top_left", "right_upper", "left_lower"}, {"right_upper": 5, "left_lower": 10})
+        for row in rows:
+            if row["seat"] in {"right_upper", "left_lower"}:
+                row["action"] = "fold"
+        fields = {"table_stakes": field("5/10(5)"), "top_left.dealer_right": field("D")}
+        positions = read_table_positions(fields, rows, vacant, "preflop")
+        self.assertEqual((positions["small_blind_seat"], positions["big_blind_seat"]), ("right_upper", "left_lower"))
+        conflict = read_table_positions(fields, rows, vacant, "preflop", conflicting_seats={"right_upper"})
+        self.assertIsNone(conflict["small_blind_seat"])
+
     def test_does_not_infer_when_amount_occupancy_action_or_street_is_uncertain(self):
         fields = {"table_stakes": field("5/10(5)"), "top_left.dealer_right": field("D")}
         variants = (

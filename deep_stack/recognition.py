@@ -46,10 +46,12 @@ _ACTIONS = {
     "raise": "raise", "raiseto": "raise",
     "全下": "all_in", "全押": "all_in", "梭哈": "all_in", "allin": "all_in",
 }
-_WAITING = frozenset({"等待中", "等待下一手", "等待下手", "等候下一手"})
-_SITTING_OUT = frozenset({"留座", "休息中", "暂离", "暫離", "sitout"})
-_SEAT_LABELS = _WAITING | _SITTING_OUT | frozenset({"空位", "坐下", "等待加入", "离座", "離座"})
-_VACANT_LABELS = frozenset({"空位", "坐下", "等待加入", "离座", "離座", "empty"})
+_WAITING = frozenset({"等待中", "等待下一手", "等待下手", "等候下一手", "等待加入"})
+_SITTING_OUT = frozenset({"留座", "休息中", "暂离", "暫離", "离座", "離座", "sitout"})
+_VACANT_LABELS = frozenset({
+    "空位", "空座", "空座位", "坐下", "点击入座", "點擊入座", "点此入座", "點此入座", "empty", "emptyseat", "sithere",
+})
+_SEAT_LABELS = _WAITING | _SITTING_OUT | _VACANT_LABELS
 _AMOUNT = re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?([kmb万萬亿億])?", re.ASCII)
 _AMOUNT_PREFIX = re.compile(r"^(?:(?:总|總)?\s*底\s*池|total\s*pot|pot|筹码|籌碼)\s*:?\s*")
 _ACTION_WITH_AMOUNT = re.compile(r"([^0-9]+?)([0-9].*)")
@@ -118,8 +120,9 @@ def live_profile():
         add(f"{seat}.portrait", x - 49, y - 49, 98, 98, "marker")
         stack = regions[f"{seat}.stack"]
         dealer_y = (stack["y"] + stack["height"] / 2) * 1470 + 242
-        distance = 108 if seat == "hero" else 75
-        if seat == "hero":
+        bottom_seat = seat in {"hero", "bottom_center"}
+        distance = 108 if bottom_seat else 75
+        if bottom_seat:
             dealer_y = 1440
         add(f"{seat}.dealer_left", x - distance - 16, dealer_y - 17, 33, 34, "label")
         add(f"{seat}.dealer_right", x + distance - 16, dealer_y - 17, 33, 34, "label")
@@ -173,11 +176,11 @@ def _countable_amount(text):
     return match is not None and match.group(3) is None
 
 
-def _texts(fields, key):
+def _texts(fields, key, *, minimum=_MIN_CONFIDENCE):
     return tuple(
         _normalized(item["text"])
         for item in fields.get(key, {}).get("observations", [])
-        if item["confidence"] >= _MIN_CONFIDENCE and item["text"].strip()
+        if item["confidence"] >= minimum and item["text"].strip()
     )
 
 
@@ -267,37 +270,60 @@ def _confirmed_seat(seat):
 
 def _seat_text(fields, seat):
     return {_compact(text) for suffix in ("label", "status", "avatar")
-            for text in _texts(fields, f"{seat}.{suffix}")}
+            for text in _texts(fields, f"{seat}.{suffix}", minimum=0.75)}
 
 
-def _table_state(fields, *, vacancy_markers=(), force_spectator=False, seat_capacity=None):
+def _seating_status(fields, row, vacant_marker, has_cardback):
+    seat = row["seat"]
+    labels = _seat_text(fields, seat)
+    vacant = vacant_marker or bool(labels & _VACANT_LABELS)
+    inactive = bool(labels & (_WAITING | _SITTING_OUT))
+    acting = has_cardback or row["action"] is not None or row["wager"] not in (None, 0)
+    occupied = acting or row["stack"] is not None or (
+        row["name"] in _texts(fields, f"{seat}.label", minimum=0.75)
+    )
+    if (vacant and (occupied or inactive)) or (inactive and acting):
+        return "conflict"
+    if vacant:
+        return "vacant"
+    if inactive:
+        return "inactive"
+    return "occupied" if occupied else "unknown"
+
+
+def _table_state(fields, *, vacancy_markers=(), occupied_markers=(), force_spectator=False, seat_capacity=None):
     warnings = []
     by_id = {seat: _seat(fields, seat, warnings) for seat in SEAT_IDS}
-    vacancies = set(vacancy_markers)
-    for seat in SEAT_IDS + EXTRA_SEAT_IDS:
-        labels = _texts(fields, f"{seat}.label") + _texts(fields, f"{seat}.status")
-        if any(_compact(text) in _VACANT_LABELS for text in labels):
-            vacancies.add(seat)
+    alternate_warnings = {seat: [] for seat in EXTRA_SEAT_IDS}
+    alternates = {seat: _seat(fields, seat, alternate_warnings[seat]) for seat in EXTRA_SEAT_IDS}
+    vacancy_markers = set(vacancy_markers)
+    occupied_markers = set(occupied_markers)
+    status = {
+        seat: _seating_status(fields, row, seat in vacancy_markers, seat in occupied_markers)
+        for seat, row in (by_id | alternates).items()
+    }
     observed_hero = [_card(fields, key) for key in _HERO_FIELDS]
     hero_cards = observed_hero if all(observed_hero) and len(set(observed_hero)) == 2 else None
     own_cards_visible = any(observed_hero) or any(fields.get(key, {}).get("card_surface") for key in _HERO_FIELDS)
 
-    alternate_warnings = []
-    top = _seat(fields, "top_center", alternate_warnings)
-    single_top = _confirmed_seat(top) or "top_center" in vacancies
+    top = alternates["top_center"]
+    single_top = status["top_center"] == "vacant" or (
+        status["top_center"] != "conflict" and _confirmed_seat(top)
+    )
     twin_top = any(
-        _confirmed_seat(by_id[key]) or key in vacancies or (own_cards_visible and by_id[key]["stack"] is not None)
+        status[key] == "vacant" or (status[key] != "conflict" and (
+            _confirmed_seat(by_id[key]) or (own_cards_visible and by_id[key]["stack"] is not None)
+        ))
         for key in ("top_left", "top_right")
     )
     eight_seats = seat_capacity == 8 or (seat_capacity is None and single_top and not twin_top)
     if eight_seats:
         seats = [top, *(seat for key, seat in by_id.items() if key not in {"top_left", "top_right"})]
-        warnings.extend(alternate_warnings)
+        warnings.extend(alternate_warnings["top_center"])
     else:
         seats = list(by_id.values())
 
-    alternate_warnings = []
-    bottom = _seat(fields, "bottom_center", alternate_warnings)
+    bottom = alternates["bottom_center"]
     hero_status = _seat_text(fields, "hero")
     waiting_banner = any(_compact(text) in _WAITING for text in _texts(fields, "hero_waiting_banner"))
     spectator_hint = any(
@@ -305,15 +331,19 @@ def _table_state(fields, *, vacancy_markers=(), force_spectator=False, seat_capa
         for key in _SPECTATOR_HINTS for reading in fields.get(key, {}).get("observations", [])
         if reading["confidence"] >= 0.75
     )
-    other_seats_confirmed = sum(_confirmed_seat(seat) for seat in seats if seat["seat"] != "hero") >= 2
+    other_seats_confirmed = sum(_confirmed_seat(seat) and status[seat["seat"]] == "occupied"
+                                for seat in seats if seat["seat"] != "hero") >= 2
     hero_evidence = own_cards_visible or waiting_banner or by_id["hero"]["stack"] is not None
+    bottom_is_visible = status["bottom_center"] == "vacant" or (
+        status["bottom_center"] != "conflict" and _confirmed_seat(bottom)
+    )
     spectating = force_spectator or (not hero_evidence and (
-        spectator_hint or (_confirmed_seat(bottom) and other_seats_confirmed)
+        spectator_hint or (bottom_is_visible and other_seats_confirmed)
     ))
     if spectating:
         seats = [bottom if seat["seat"] == "hero" else seat for seat in seats]
         hero_cards = None
-        warnings.extend(alternate_warnings)
+        warnings.extend(alternate_warnings["bottom_center"])
         hero_state = "spectating"
     elif waiting_banner or (hero_evidence and hero_status & _WAITING):
         hero_state = "waiting_for_hand"
@@ -326,11 +356,11 @@ def _table_state(fields, *, vacancy_markers=(), force_spectator=False, seat_capa
     if hero_state in {"waiting_for_hand", "sitting_out"}:
         if by_id["hero"]["stack"] is None:
             by_id["hero"]["stack"] = bottom["stack"]
+        status["hero"] = "inactive" if status["hero"] not in {"vacant", "conflict"} else "conflict"
         hero_cards = None
-    inactive = [row["seat"] for row in seats if row["seat"] not in vacancies and (
-        hero_state in {"waiting_for_hand", "sitting_out"} if row["seat"] == "hero"
-        else bool(_seat_text(fields, row["seat"]) & (_WAITING | _SITTING_OUT))
-    )]
+    elif own_cards_visible and not spectating:
+        status["hero"] = "occupied" if status["hero"] in {"unknown", "occupied"} else "conflict"
+    seat_status = {row["seat"]: status[row["seat"]] for row in seats}
 
     pot = _read_amount(fields, "pot", warnings)
     center_pot = _read_amount(fields, "center_pot", warnings)
@@ -368,8 +398,9 @@ def _table_state(fields, *, vacancy_markers=(), force_spectator=False, seat_capa
         "hero_state": hero_state,
         "seat_capacity": len(seats),
         "seat_layout_confirmed": seat_capacity is not None or single_top != twin_top,
-        "vacant_seats": [row["seat"] for row in seats if row["seat"] in vacancies],
-        "inactive_seats": inactive,
+        "seat_status": seat_status,
+        "vacant_seats": [seat for seat, state in seat_status.items() if state == "vacant"],
+        "inactive_seats": [seat for seat, state in seat_status.items() if state == "inactive"],
         "hero_cards": hero_cards,
         "board": board,
         "street": street,
@@ -606,25 +637,24 @@ def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=F
         if key.endswith(".avatar") and not _overlap(bounds, panel)
         and _vacancy_marker(_region_image(image, bounds))
     ]
-    result = _table_state(fields, vacancy_markers=empty, force_spectator=force_spectator,
+    cardbacks = [
+        key.partition(".")[0] for key, bounds in pixels.items()
+        if key.endswith(".cardback") and not _overlap(bounds, panel)
+        and _has_cardback(_region_image(image, bounds))
+    ]
+    result = _table_state(fields, vacancy_markers=empty, occupied_markers=cardbacks, force_spectator=force_spectator,
                           seat_capacity=seat_capacity)
     if viewport is not None:
         result["viewport"] = list(viewport)
         result["warnings"].extend(warnings)
         result["layout_mismatch"] = bool(warnings)
     if live:
-        result["cardbacks"] = []
         enabled_seats = {seat["seat"] for seat in result["seats"]}
-        for key, bounds in pixels.items():
-            seat, _, field = key.partition(".")
-            if seat not in enabled_seats:
-                continue
-            if field == "cardback" and _has_cardback(_region_image(image, bounds)):
-                result["cardbacks"].append(seat)
+        result["cardbacks"] = [seat for seat in cardbacks if seat in enabled_seats]
         result["seat_avatars"] = {
             key.partition(".")[0]: signature for key, bounds in pixels.items()
             if key.endswith(".portrait") and (popup_badge or key.partition(".")[0] in enabled_seats)
-            and key.partition(".")[0] not in empty and not _overlap(bounds, panel)
+            and key.partition(".")[0] not in result["vacant_seats"] and not _overlap(bounds, panel)
             and (signature := avatar_signature(_region_image(image, bounds))) is not None
         }
         if popup_badge and (portrait := pixels.get("player_popup_portrait")) is not None:
@@ -641,13 +671,14 @@ def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=F
             result["positions"] = read_table_positions(
                 fields, result["seats"], result["vacant_seats"], result["street"],
                 inactive_seats=result["inactive_seats"],
+                conflicting_seats={seat for seat, state in result["seat_status"].items() if state == "conflict"},
             )
             if result["spectating"] and not result["hero_evidence"] and result["seat_layout_confirmed"]:
                 result["avatar_points"] = {
                     row["seat"]: (box[0] + box[2] // 2, box[1] + box[3] // 2)
                     for row in result["seats"]
                     if row["seat"] in result["seat_avatars"]
-                    and row["seat"] not in result["vacant_seats"] and _confirmed_seat(row)
+                    and result["seat_status"][row["seat"]] == "occupied" and _confirmed_seat(row)
                     and (box := pixels.get(f"{row['seat']}.portrait")) is not None
                 }
         result["popup_open"] = bool(popup_badge)

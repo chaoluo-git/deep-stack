@@ -8,7 +8,9 @@ import unittest
 from unittest.mock import patch
 
 from deep_stack.ev import analyze
-from deep_stack.live import HandTracker, LiveCapture, PopupTracker, _state, _table_summary, scan_live
+from deep_stack.layout import SEAT_IDS
+from deep_stack.live import HandTracker, LiveCapture, PopupTracker, _state, scan_live
+from deep_stack.live_table import TableLog
 
 
 _HERO = ["As", "Ks"]
@@ -38,6 +40,24 @@ def frame(*, own_timer=True, passive="跟注 50"):
         "center_pot": 100,
         "evidence": evidence,
         "cardbacks": [],
+    }
+
+
+def eight_seat_frame(street="flop"):
+    order = ("top_center", *("bottom_center" if key == "hero" else key for key in SEAT_IDS[2:]))
+    vacancy = "right_upper"
+    return {
+        **frame(own_timer=False),
+        "seats": [seat(key, action="call" if key == "left_lower" else None,
+                       stack=None if key == vacancy else 400, wager=5 if key == "left_lower" else None)
+                  for key in order],
+        "seat_capacity": 8, "seat_layout_confirmed": True, "spectating": True, "hero_cards": None,
+        "seat_status": {key: "vacant" if key == vacancy else "occupied" for key in order},
+        "vacant_seats": [vacancy], "cardbacks": [key for key in order if key != vacancy],
+        "street": street, "board": _RIVER[:{"flop": 3, "turn": 4, "river": 5}[street]],
+        "positions": {"dealer_seat": "top_center", "small_blind_seat": "right_middle",
+                      "big_blind_seat": "right_lower", "small_blind": 5, "big_blind": 10,
+                      "sources": {"dealer_seat": "dealer_marker"}},
     }
 
 
@@ -72,21 +92,32 @@ class LiveDecisionTests(unittest.TestCase):
         self.assertIn("轮到自己", reason)
 
     def test_reports_new_stacks_and_retains_confirmed_blind_seats_only_for_the_same_hand(self):
-        candidate = frame()
-        candidate.update(seat_capacity=8, seat_layout_confirmed=True, spectating=False)
-        candidate["positions"] = {"dealer_seat": "top_center", "small_blind_seat": "right_upper",
-                                  "big_blind_seat": "right_middle", "small_blind": 5, "big_blind": 10}
-        output = StringIO()
-        with redirect_stdout(output):
-            previous = _table_summary(candidate, None, True, "first")
-            candidate["seats"][0]["stack"] = 390
-            candidate["positions"].update(small_blind_seat=None, big_blind_seat=None)
-            previous = _table_summary(candidate, previous, True, "first")
-            _table_summary(candidate, previous, True, "second")
-        events = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(events[1]["stacks"]["hero"], 390)
-        self.assertEqual(events[1]["small_blind_seat"], "right_upper")
-        self.assertIsNone(events[2]["small_blind_seat"])
+        candidate = eight_seat_frame()
+        table = TableLog()
+        first = table.update(candidate, "first")
+        self.assertEqual(first["dealt_players"], 7)
+        self.assertIn("空位 右上", first["message"])
+        self.assertEqual(first["position_by_seat"]["left_middle"], "HJ")
+        candidate["seats"][0]["stack"] = 390
+        candidate["positions"].update(small_blind_seat=None, big_blind_seat=None)
+        second = table.update(candidate, "first")
+        self.assertEqual(second["stacks"]["top_center"], 390)
+        self.assertEqual(second["small_blind_seat"], "right_middle")
+        self.assertEqual(second["message"], "余额 上中 390")
+        self.assertIsNone(table.update(candidate, "first"))
+
+        candidate["cardbacks"].remove("left_middle")
+        candidate["seat_status"]["left_middle"] = "unknown"
+        self.assertEqual(table.update(candidate, "first")["position_by_seat"]["left_middle"], "HJ")
+        changed = table.update(candidate, "second")
+        self.assertIsNone(changed["small_blind_seat"])
+        self.assertNotIn("left_middle", changed["position_by_seat"])
+
+    def test_does_not_repeat_same_table_description_when_hand_id_is_resolved(self):
+        table = TableLog()
+        candidate = eight_seat_frame()
+        self.assertIsNotNone(table.update(candidate, None))
+        self.assertIsNone(table.update(candidate, "confirmed"))
 
     def test_waits_if_another_seat_also_has_a_timer(self):
         candidate = frame()
@@ -152,6 +183,38 @@ class LiveDecisionTests(unittest.TestCase):
             )
         events = [json.loads(line) for line in stream.getvalue().splitlines()]
         self.assertEqual([event["type"] for event in events], ["recommendation", "waiting", "recommendation"])
+
+    def test_stream_reports_the_board_and_positions_without_duplicate_table_headers(self):
+        frames = [eight_seat_frame(street) for street in ("flop", "flop", "turn", "river")]
+        stream = StringIO()
+        with patch("deep_stack.recognition.recognize", side_effect=frames), redirect_stdout(stream):
+            scan_live(frames=range(4), viewport=None, profile=None, model={}, samples=100,
+                      interval=1, max_age=100, json_lines=True, show_actions=True, show_board=True)
+        events = [json.loads(line) for line in stream.getvalue().splitlines()]
+        self.assertEqual([event["cards"] for event in events if event["type"] == "board"],
+                         [_RIVER[:3], _RIVER[:4], _RIVER])
+        self.assertEqual(sum(event["type"] == "table" for event in events), 1)
+        action = next(event for event in events if event["type"] == "action")
+        self.assertEqual((action["seat"], action["seat_label"], action["position"]), ("left_lower", "左下", "LJ"))
+        self.assertIn("LJ · 左下 跟注", action["message"])
+
+    def test_stream_requires_two_confirmed_frames_before_switching_seat_layout(self):
+        eight = eight_seat_frame()
+        nine = deepcopy(eight)
+        nine["seat_capacity"] = 9
+        nine["seats"][:1] = [seat("top_left"), seat("top_right")]
+        del nine["seat_status"]["top_center"]
+        nine["seat_status"].update(top_left="occupied", top_right="occupied")
+        nine["cardbacks"][:1] = ["top_left", "top_right"]
+        nine["positions"].update(dealer_seat="top_left", small_blind_seat="top_right",
+                                 big_blind_seat="right_middle")
+        frames = [eight, nine, eight, nine, nine]
+        stream = StringIO()
+        with patch("deep_stack.recognition.recognize", side_effect=frames), redirect_stdout(stream):
+            scan_live(frames=range(len(frames)), viewport=None, profile=None, model={}, samples=100,
+                      interval=1, max_age=100, json_lines=True, show_actions=True)
+        events = [json.loads(line) for line in stream.getvalue().splitlines()]
+        self.assertEqual([event["seat_capacity"] for event in events if event["type"] == "table"], [8, 9])
 
 
 class HandTrackerTests(unittest.TestCase):

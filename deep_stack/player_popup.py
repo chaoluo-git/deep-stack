@@ -163,8 +163,15 @@ def nickname_key(value):
 
 def match_popup(popup, seats, *, previous_seats=(), popup_avatar=None, seat_avatars=None):
     """Resolve one seat from independent, non-conflicting nickname and avatar evidence."""
+    seat, _ = resolve_popup_seat(popup, seats, previous_seats=previous_seats, popup_avatar=popup_avatar,
+                                 seat_avatars=seat_avatars)
+    return seat
+
+
+def resolve_popup_seat(popup, seats, *, previous_seats=(), popup_avatar=None, seat_avatars=None):
+    """Return the matched seat or the reason no safe binding can be made."""
     if popup is None:
-        return None
+        return None, "profile_unread"
 
     popup_name = nickname_key(popup.name)
     current = {seat["seat"]: seat for seat in seats}
@@ -184,12 +191,18 @@ def match_popup(popup, seats, *, previous_seats=(), popup_avatar=None, seat_avat
         if seat_id in current and not current[seat_id].get("vacant")
     })
     if avatar_seat is not None:
-        return avatar_seat if not matches or avatar_seat in matches else None
+        if matches and avatar_seat not in matches:
+            return None, "avatar_nickname_conflict"
+        return avatar_seat, None
 
-    if len(matches) != 1:
-        return None
+    if len(matches) > 1:
+        return None, "duplicate_nickname"
+    if not matches:
+        return None, "no_matching_seat" if popup_name else "popup_nickname_unavailable"
     seat = matches.pop()
     visible_seat = current.get(seat)
-    if not visible_seat or visible_seat.get("vacant") or names[seat] != {popup_name}:
-        return None
-    return seat
+    if not visible_seat or visible_seat.get("vacant"):
+        return None, "seat_unavailable"
+    if names[seat] != {popup_name}:
+        return None, "nickname_changed"
+    return seat, None

@@ -11,7 +11,8 @@ import unicodedata
 from uuid import uuid4
 
 from .ev import analyze
-from .player_popup import PlayerPopup, match_popup, nickname_key
+from .layout import SEAT_LABELS
+from .player_popup import PlayerPopup, nickname_key, resolve_popup_seat
 
 
 _SECONDS = re.compile(r"([1-9]\d?)\s*(?:s|秒)", re.IGNORECASE)
@@ -89,6 +90,7 @@ def _state(frame, model):
 
     empty = set(model.get("empty_seats", []))
     inactive = set(frame.get("inactive_seats", ()))
+    observed_status = frame.get("seat_status")
     cardbacks = set(frame.get("cardbacks", []))
     occupied = []
     for seat in seats:
@@ -96,8 +98,11 @@ def _state(frame, model):
         action = seat["action"]
         active = key == "hero" or key in cardbacks or action in _LIVE_ACTIONS
         visibly_empty = key in frame.get("vacant_seats", [])
-        visibly_empty |= any(text in _OUT for text in _texts(frame, f"{key}.status"))
-        visibly_empty |= any(text in _OUT for text in _texts(frame, f"{key}.label"))
+        if observed_status is None:
+            visibly_empty |= any(text in _OUT for region in ("status", "label")
+                                 for text in _texts(frame, f"{key}.{region}"))
+        elif observed_status.get(key) == "conflict":
+            return None, f"{SEAT_LABELS.get(key, key)}的占座读数冲突", deadline
         if key in empty or visibly_empty:
             if active or action == "fold":
                 return None, f"{key} 的空席设置与画面冲突", deadline
@@ -334,6 +339,17 @@ def _visible_names(seats):
     return {seat["seat"]: seat["name"] for seat in seats if seat.get("name") and not seat["vacant"]}
 
 
+_POPUP_SEAT_REASONS = {
+    "avatar_nickname_conflict": "头像和昵称指向不同座位",
+    "duplicate_nickname": "桌上出现同名玩家，头像未能区分",
+    "seat_unavailable": "昵称对应的座位已空出或当前不可见",
+    "nickname_changed": "同一座位的前后昵称不一致",
+    "no_matching_seat": "当前没有能唯一对应的牌桌昵称或头像",
+    "popup_nickname_unavailable": "弹窗昵称没读清，头像也无法唯一对应",
+    "evidence_varies": "相邻两帧的座位证据不一致",
+}
+
+
 class PopupTracker:
     """Two readings confirm a visible stable ID before it can change a binding."""
 
@@ -380,20 +396,24 @@ class PopupTracker:
         seats, avatars = _seat_evidence(frame, previous)
         avatar_views = {seat: [avatars.get(seat), previous_avatars.get(seat)]
                         for seat in avatars.keys() | previous_avatars.keys()}
-        seat = match_popup(popup, seats, previous_seats=previous, popup_avatar=frame.get("popup_avatar"),
-                           seat_avatars=avatar_views)
+        seat, seat_reason = resolve_popup_seat(
+            popup, seats, previous_seats=previous, popup_avatar=frame.get("popup_avatar"),
+            seat_avatars=avatar_views,
+        )
         key = (popup.player_id, seat)
         saved_event = self.saved[1] if self.saved else None
         if seat is None and saved_event and saved_event["type"] == "player_bound":
             return saved_event
         last = self.candidate
-        self.candidate = (key, popup.stats, popup.name)
+        self.candidate = (key, popup.stats, popup.name, seat_reason)
         if last is None or last[0] != key:
             return {"type": "waiting", "message": "正在复核弹窗 ID，请保持弹窗片刻"}
 
         name = popup.name if nickname_key(popup.name) == nickname_key(last[2]) else None
         stats = {name: value for name, value in popup.stats.items() if last[1].get(name) == value}
-        snapshot = (key, name, stats)
+        if seat is None and last[3] != seat_reason:
+            seat_reason = "evidence_varies"
+        snapshot = (key, name, stats, seat_reason)
         if self.saved and self.saved[0] == snapshot:
             return saved_event
         event = {"type": "player_profile", "player_id": popup.player_id, "name": name,
@@ -401,9 +421,13 @@ class PopupTracker:
         if store is not None and len(stats) == 4:
             store.save_profile(popup.player_id, name=name, stats=stats)
         if seat is None:
-            message = f"已读到 ID {popup.player_id}，座位未能唯一确认"
+            event["seat_match_reason"] = seat_reason
+            reason = _POPUP_SEAT_REASONS[seat_reason]
+            message = f"已读到 ID {popup.player_id}，座位未能唯一确认（{reason}）"
+            if not self.popup_reference and seat_reason in {"no_matching_seat", "popup_nickname_unavailable"}:
+                message += "。可先关闭资料，等牌桌读数恢复后再打开同一头像"
         elif store is None:
-            message = f"已读到 {seat} 的 ID {popup.player_id}"
+            message = f"已读到{SEAT_LABELS.get(seat, seat)}的 ID {popup.player_id}"
         else:
             desk_name = repeated.get(seat)
             shown_name = _visible_names(seats).get(seat)
@@ -416,7 +440,7 @@ class PopupTracker:
                 message = f"已读到 ID {popup.player_id}，绑定待处理：{error}"
             else:
                 event["type"] = "player_bound"
-                message = f"已将 {seat} 绑定到玩家 ID {popup.player_id}"
+                message = f"已将{SEAT_LABELS.get(seat, seat)}绑定到玩家 ID {popup.player_id}"
         event["message"] = message
         event["fingerprint"] = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
         self.saved = (snapshot, event)
@@ -439,51 +463,23 @@ def _emit(event, json_lines):
         print(event["message"], flush=True)
 
 
-def _table_summary(frame, previous, json_lines, hand=None):
-    positions = frame.get("positions", {})
-    if not frame.get("seat_layout_confirmed") and not any(positions.values()):
-        return previous
-    stacks = {seat["seat"]: seat["stack"] for seat in frame["seats"] if seat["stack"] is not None}
-    details = {
-        "seat_capacity": frame.get("seat_capacity"), "spectating": frame["spectating"],
-        "hero_state": frame.get("hero_state"),
-        **{key: value for key, value in positions.items() if key != "sources"},
-        "hand_id": hand, "stacks": stacks,
-    }
-    if hand and previous and previous["hand_id"] == hand and (
-        details.get("dealer_seat") and details.get("dealer_seat") == previous.get("dealer_seat")
-    ):
-        for key in ("small_blind_seat", "big_blind_seat"):
-            if details.get(key) is None:
-                details[key] = previous.get(key)
-    if details == previous:
-        return previous
-    stakes = f"{positions.get('small_blind', '待核对') or '待核对'}/{positions.get('big_blind', '待核对') or '待核对'}"
-    ante = positions.get("ante")
-    message = (f"牌桌 {frame.get('seat_capacity', '?')} 座｜盲注 {stakes}"
-               f"｜ante {ante if ante is not None else '待核对'}"
-               f"｜庄 {positions.get('dealer_seat') or '待核对'}"
-               f"｜小盲位 {details.get('small_blind_seat') or '待核对'}"
-               f"｜大盲位 {details.get('big_blind_seat') or '待核对'}")
-    if stacks:
-        message += "｜余额 " + "、".join(f"{seat} {stack:g}" for seat, stack in stacks.items())
-    _emit({"type": "table", **details, "message": message}, json_lines)
-    return details
-
-
 def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
               json_lines, database=None, session=None, window_id=None,
-              force_spectator=False, seat_capacity=None, show_actions=False, scan_avatars=False):
+              force_spectator=False, seat_capacity=None, show_actions=False, show_board=False, scan_avatars=False):
     from .avatar_match import avatars_conflict
     from .live_actions import ActionLog
+    from .live_board import BoardLog
+    from .live_table import TableLog
     from .recognition import recognize
 
     model = validate_model(model)
     tracker = HandTracker()
     popups = PopupTracker()
     actions = ActionLog()
+    boards = BoardLog()
+    tables = TableLog()
     last_viewport = None
-    table_summary = table_capacity = None
+    table_capacity = pending_capacity = None
     portraits = {}
     scanner = None
     if scan_avatars:
@@ -513,8 +509,10 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
                         tracker = HandTracker()
                         popups = PopupTracker()
                         actions = ActionLog()
+                        boards = BoardLog()
+                        tables = TableLog()
                         portraits.clear()
-                        table_summary = table_capacity = None
+                        table_capacity = pending_capacity = None
                         capture.previous_window = captured_window
                 else:
                     image, captured_window = next(source), None
@@ -539,12 +537,25 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
                 if event is not None and event["type"] == "player_bound":
                     if (portrait := frame.get("popup_avatar")) is not None:
                         portraits[event["seat"]] = (event["player_id"], portrait)
+                awaiting_layout = pending_capacity is not None
                 if event is None:
-                    capacity = frame.get("seat_capacity") if frame.get("seat_layout_confirmed") else None
+                    reported_capacity = frame.get("seat_capacity")
+                    capacity = reported_capacity if frame.get("seat_layout_confirmed") else None
+                    awaiting_layout = (reported_capacity is not None and table_capacity is not None
+                                       and reported_capacity != table_capacity
+                                       and (capacity is None or capacity != pending_capacity))
+                    pending_capacity = capacity if awaiting_layout else None
+                    if awaiting_layout:
+                        event = {"type": "waiting", "message": "座位布局发生变化，正在复核"}
+                if event is None:
                     table_changed = capacity is not None and table_capacity is not None and capacity != table_capacity
                     if table_changed:
                         tracker = HandTracker()
+                        popups = PopupTracker()
+                        popups.update(frame, store, session, monotonic())
                         actions = ActionLog()
+                        boards = BoardLog()
+                        tables = TableLog()
                         portraits.clear()
                     if capacity is not None:
                         table_capacity = capacity
@@ -569,16 +580,19 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
                             _emit({"type": "binding_paused", "seats": paused,
                                    "message": f"需重新确认玩家 ID {'、'.join(paused)}"}, json_lines)
                         last_log_status = paused
+                    if show_board and (board_event := boards.update(frame, hand)) is not None:
+                        _emit(board_event, json_lines)
                     if show_actions:
-                        table_summary = _table_summary(frame, table_summary, json_lines, hand)
+                        if (table_event := tables.update(frame, hand)) is not None:
+                            _emit(table_event, json_lines)
                         stacks = {seat["seat"]: seat["stack"] for seat in frame["seats"]}
-                        for action in actions.update(frame, hand, bindings):
+                        for action in actions.update(frame, hand, bindings, positions=tables.position_by_seat):
                             if (stack := stacks.get(action["seat"])) is not None:
                                 action["stack"] = stack
                                 action["message"] += f"｜余额 {stack:g}"
                             _emit(action, json_lines)
                     event = _decision_event(frame, model, samples, previous, started, max_age)
-                if scanner is not None and captured_window is not None:
+                if scanner is not None and captured_window is not None and not awaiting_layout:
                     scan_event = scanner.step(
                         frame, window_id=captured_window, image_size=image.size,
                         now=monotonic(), captured_at=started, bindings=bindings,
