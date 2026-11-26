@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from decimal import Decimal
 from importlib.util import find_spec
 import json
@@ -23,6 +24,7 @@ from .layout import (
     pixel_regions,
     validate_viewport,
 )
+from .player_popup import POPUP_REGIONS, parse_popup
 
 
 class RecognitionError(ValueError):
@@ -73,9 +75,18 @@ def live_profile():
             "x": center_x + offset / 3024, "y": center_y + 9 / 1470,
             "width": 42 / 3024, "height": 41 / 1470, "kind": "marker",
         }
-    regions["hero_passive_button"] = {
-        "x": 0.36, "y": 0.78, "width": 0.55, "height": 0.15, "kind": "label",
-    }
+    def add(key, x, y, width, height, kind):
+        regions[key] = {"x": x / 3024, "y": (y - 242) / 1470, "width": width / 3024,
+                        "height": height / 1470, "kind": kind}
+
+    add("hero_passive_button", 1089, 1388, 1663, 220, "label")
+    add("player_popup_id", 1384, 568, 235, 39, "label")
+    add("player_popup_id_label", 1387, 569, 37, 37, "label")
+    add("player_popup_id_value", 1425, 568, 194, 39, "number")
+    add("player_popup_name", 1422, 517, 370, 51, "label")
+    for key, x in (("hands", 1284), ("win_rate", 1437), ("pot_entry_rate", 1589),
+                   ("showdown_win_rate", 1740)):
+        add(f"player_popup_{key}", x - 56, 875, 112, 45, "number")
     return profile
 
 
@@ -352,7 +363,36 @@ def _has_cardback(image):
     return red_rows >= 9 and white >= 12
 
 
-def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=False, backend=None):
+def _region_image(image, bounds):
+    x, y, width, height = bounds
+    return image.crop((x, y, x + width, y + height))
+
+
+def _popup_badge(image, profile, viewport):
+    bounds = pixel_regions(profile, viewport).get("player_popup_id_label")
+    if bounds is None:
+        return False
+    pixels = list(_region_image(image, bounds).resize((16, 16)).get_flattened_data())
+    amber = sum(r >= 125 and 18 <= r - g <= 115 and 18 <= g - b <= 110 for r, g, b in pixels)
+    return amber >= 32
+
+
+def _vacancy_marker(image):
+    """Require the thin gray cross centered on the empty green seat."""
+    pixels = image.resize((40, 20)).load()
+
+    def bright(x, y):
+        pixel = pixels[x, y]
+        return min(pixel) >= 100 and max(pixel) - min(pixel) <= 55
+
+    horizontal = max(sum(bright(x, y) for x in range(14, 26)) for y in range(8, 13))
+    vertical = max(sum(bright(x, y) for y in range(3, 17)) for x in range(18, 23))
+    corners = sum(bright(x, y) for x in (13, 16, 24, 27) for y in (3, 6, 14, 17))
+    return horizontal >= 10 and vertical >= 12 and corners <= 2
+
+
+def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=False, backend=None,
+              popup_fallback=None):
     """Read visible table fields from a saved screenshot or a Pillow image."""
     try:
         viewport = validate_viewport(viewport)
@@ -362,11 +402,19 @@ def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=F
         image = Path(image).expanduser()
         if not image.is_file():
             raise RecognitionError(f"找不到截图文件：{image}")
+    profile = profile or (live_profile() if live else default_profile())
     has_pixels = not isinstance(image, Path) or auto_viewport or live
     if has_pixels:
         image = _open_image(image)
         if auto_viewport and viewport is None:
             viewport = detect_viewport(image)
+            if viewport is None and live and popup_fallback:
+                try:
+                    fallback = validate_viewport(popup_fallback, image.size)
+                except ValueError:
+                    fallback = None
+                if fallback and _popup_badge(image, profile, fallback):
+                    viewport = fallback
             if viewport is None:
                 raise RecognitionError("未定位到单一横向绿色牌桌，请核对可见窗口或指定 --viewport")
         try:
@@ -374,23 +422,34 @@ def recognize(image, *, viewport=None, profile=None, auto_viewport=False, live=F
         except ValueError as exc:
             raise RecognitionError(str(exc)) from exc
 
-    profile = profile or (live_profile() if live else default_profile())
     warnings = layout_warnings(profile, viewport) if viewport else []
     if live and warnings:
         raise RecognitionError(warnings[0])
     if live and backend is None and find_spec("rapidocr") and find_spec("onnxruntime"):
         backend = "portable"
-    regions = {key: bounds for key, bounds in profile.regions.items() if bounds["kind"] != "marker"}
-    result = _table_state(_fields(image, viewport, regions, backend))
+    popup_badge = live and _popup_badge(image, profile, viewport)
+    regions = {
+        key: bounds for key, bounds in profile.regions.items()
+        if bounds["kind"] != "marker" and (key not in POPUP_REGIONS or popup_badge)
+    }
+    fields = _fields(image, viewport, regions, backend)
+    result = _table_state(fields)
     if viewport is not None:
         result["viewport"] = list(viewport)
         result["warnings"].extend(warnings)
         result["layout_mismatch"] = bool(warnings)
     if live:
         result["cardbacks"] = []
-        for key, (x, y, width, height) in pixel_regions(profile, viewport).items():
-            if key.endswith(".cardback") and _has_cardback(image.crop((x, y, x + width, y + height))):
-                result["cardbacks"].append(key.split(".")[0])
+        for key, bounds in pixel_regions(profile, viewport).items():
+            seat, _, field = key.partition(".")
+            if field == "cardback" and _has_cardback(_region_image(image, bounds)):
+                result["cardbacks"].append(seat)
+            if field == "avatar" and _vacancy_marker(_region_image(image, bounds)):
+                if seat not in result["vacant_seats"]:
+                    result["vacant_seats"].append(seat)
+        result["popup_open"] = bool(popup_badge)
+        popup = parse_popup(fields, badge=True) if popup_badge else None
+        result["player_popup"] = asdict(popup) if popup is not None else None
     return result
 
 

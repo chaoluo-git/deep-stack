@@ -11,6 +11,7 @@ _PLAYER_ID = re.compile(r"[0-9]*[1-9][0-9]*")
 _STREETS = ("preflop", "flop", "turn", "river")
 _ACTIONS = ("fold", "check", "call", "bet", "raise", "all_in")
 _TERMINAL = {"fold", "all_in"}
+_PROFILE_RATES = ("win_rate", "pot_entry_rate", "showdown_win_rate")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS players (
@@ -56,6 +57,17 @@ CREATE TABLE IF NOT EXISTS confirmed_preflop (
     pfr INTEGER NOT NULL,
     PRIMARY KEY (session_id, hand_id, player_id)
 );
+CREATE TABLE IF NOT EXISTS club_profiles (
+    profile_id INTEGER PRIMARY KEY,
+    player_id TEXT NOT NULL REFERENCES players(player_id),
+    name TEXT,
+    hands INTEGER NOT NULL,
+    win_rate REAL NOT NULL,
+    pot_entry_rate REAL NOT NULL,
+    showdown_win_rate REAL NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS club_profiles_player ON club_profiles(player_id, profile_id);
 """
 
 
@@ -85,6 +97,27 @@ def _visible_wager(value):
     if type(value) not in (int, float) or not 0 <= value <= 1e12 or not isfinite(value):
         raise ValueError("可见本街投入必须是 0 到 10^12 之间的有限数字")
     return value
+
+
+def _profile_stats(stats):
+    if not isinstance(stats, dict) or stats.keys() != {"hands", *_PROFILE_RATES}:
+        raise ValueError("画像须包含局数、胜率、入池率和摊牌胜率")
+    hands = stats["hands"]
+    if type(hands) is not int or not 0 <= hands <= 2**63 - 1:
+        raise ValueError("画像局数必须是非负整数")
+    result = {"hands": hands}
+    for key in _PROFILE_RATES:
+        value = stats[key]
+        if type(value) not in (int, float) or not 0 <= value <= 1:
+            raise ValueError(f"画像 {key} 必须为 0 到 1 之间的数字")
+        result[key] = float(value)
+    return result
+
+
+def _history_limit(limit):
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("记录条数必须是 1 到 1000 之间的整数")
+    return limit
 
 
 class PlayerStore:
@@ -262,6 +295,35 @@ class PlayerStore:
                 (session_id, hand_id, row["player_id"], vpip, pfr),
             )
 
+    def save_profile(self, player_id, *, name, stats):
+        """Record a changed, visibly displayed club profile without affecting seat bindings."""
+        player_id, name, stats = _player_id(player_id), _name(name), _profile_stats(stats)
+        with self._write():
+            previous = self.profiles(player_id, limit=1)
+            if previous and previous[0]["name"] == name and previous[0]["stats"] == stats:
+                return False
+            self._db.execute("INSERT OR IGNORE INTO players (player_id) VALUES (?)", (player_id,))
+            self._db.execute(
+                """INSERT INTO club_profiles
+                   (player_id, name, hands, win_rate, pot_entry_rate, showdown_win_rate)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (player_id, name, stats["hands"], *(stats[key] for key in _PROFILE_RATES)),
+            )
+        return True
+
+    def profiles(self, player_id, *, limit=100):
+        """Return recent separately recorded club profiles, newest first."""
+        rows = self._db.execute(
+            """SELECT name, hands, win_rate, pot_entry_rate, showdown_win_rate, recorded_at
+               FROM club_profiles WHERE player_id = ? ORDER BY profile_id DESC LIMIT ?""",
+            (_player_id(player_id), _history_limit(limit)),
+        )
+        return [
+            {"name": row["name"], "stats": {key: row[key] for key in ("hands", *_PROFILE_RATES)},
+             "recorded_at": row["recorded_at"]}
+            for row in rows
+        ]
+
     def stats(self, player_id):
         """Return observation counts and rates with an independently verified denominator."""
         player_id = _player_id(player_id)
@@ -298,6 +360,7 @@ class PlayerStore:
                FROM confirmed_preflop WHERE player_id = ?""",
             (player_id,),
         ).fetchone()
+        profiles = self.profiles(player_id, limit=1)
         return {
             "player_id": player_id, "registered": registered,
             "observed_hands": observed_hands, "action_count": sum(actions.values()),
@@ -305,14 +368,13 @@ class PlayerStore:
             "confirmed_preflop_hands": confirmed, "vpip_hands": vpip, "pfr_hands": pfr,
             "vpip": vpip / confirmed if confirmed else None,
             "pfr": pfr / confirmed if confirmed else None,
+            "club_profile": profiles[0]["stats"] if profiles else None,
         }
 
     def events(self, player_id, *, limit=100):
         """Return visible actions, newest observation first."""
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise ValueError("记录条数必须是 1 到 1000 之间的整数")
         return [dict(row) for row in self._db.execute(
             """SELECT session_id, hand_id, seat, street, kind AS action, wager, recorded_at
                FROM visible_actions WHERE player_id = ? ORDER BY event_id DESC LIMIT ?""",
-            (_player_id(player_id), limit),
+            (_player_id(player_id), _history_limit(limit)),
         )]

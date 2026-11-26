@@ -138,3 +138,38 @@ class PlayerStoreTests(unittest.TestCase):
         self.store.unbind("A", "right_upper")
         self.store.bind("A", "hero", "1")
         self.assertEqual(self.store.bindings("A")[0]["seat"], "hero")
+
+    def test_club_profile_is_deduplicated_and_kept_separate_from_observations(self):
+        player_id = "00123"
+        club = {"hands": 100, "win_rate": 0.25, "pot_entry_rate": 0.42, "showdown_win_rate": 0.56}
+        self.store.bind("A", "right_upper", player_id, name="牌桌昵称")
+        self.store.record_frame("A", "hand1", frame(reading(action="fold")))
+        self.assertIsNone(self.store.stats(player_id)["club_profile"])
+        self.assertTrue(self.store.save_profile(player_id, name="俱乐部昵称", stats=club))
+        self.assertFalse(self.store.save_profile(player_id, name=" 俱乐部昵称 ", stats=club))
+        newer = {**club, "hands": 101}
+        self.assertTrue(self.store.save_profile(player_id, name="俱乐部昵称", stats=newer))
+
+        with PlayerStore(self.path) as reopened:
+            profiles = reopened.profiles(player_id, limit=2)
+            self.assertEqual([item["stats"] for item in profiles], [newer, club])
+            self.assertEqual(reopened.profiles(player_id, limit=1), profiles[:1])
+            self.assertTrue(profiles[0]["recorded_at"])
+            stats = reopened.stats(player_id)
+            self.assertEqual(stats["club_profile"], newer)
+            self.assertEqual(stats["actions"]["fold"], 1)
+            self.assertIsNone(stats["vpip"])
+            self.assertIsNone(stats["pfr"])
+            self.assertEqual(reopened.bindings("A")[0]["name"], "牌桌昵称")
+
+    def test_club_profile_requires_all_four_well_formed_counts_and_rates(self):
+        base = {"hands": 0, "win_rate": 0, "pot_entry_rate": 0, "showdown_win_rate": 0}
+        for invalid in ({}, {**base, "hands": False}, {**base, "hands": -1}, {**base, "hands": 2**63},
+                        {**base, "pot_entry_rate": "42%"}, {**base, "win_rate": 1.1},
+                        {**base, "showdown_win_rate": float("nan")}):
+            with self.subTest(stats=invalid), self.assertRaises(ValueError):
+                self.store.save_profile("1", name=None, stats=invalid)
+        self.assertFalse(self.store.stats("1")["registered"])
+        self.assertEqual(self.store.profiles("1"), [])
+        self.assertTrue(self.store.save_profile("1", name=None, stats=base))
+        self.assertTrue(self.store.stats("1")["registered"])

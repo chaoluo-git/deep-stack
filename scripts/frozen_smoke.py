@@ -59,9 +59,42 @@ def assert_live_replay(executable, folder, screenshot, font, env):
         raise ValueError(f"Unexpected live replay events: {events}")
 
 
+def assert_profile_replay(executable, folder, fixtures, env):
+    popup = folder / "popup.png"
+    database = folder / "popup.sqlite3"
+    fixtures["draw_popup_fixture"]().save(popup)
+    viewport = ",".join(map(str, fixtures["POPUP_VIEWPORT"]))
+    output = subprocess.check_output(
+        [executable, "live", "--frames", popup, popup, "--db", database, "--session", "popup-test",
+         "--viewport", viewport, "--json"],
+        cwd=folder, env=env, encoding="utf-8", timeout=180,
+    )
+    events = [json.loads(line) for line in output.splitlines()]
+    expected = {
+        "player_id": fixtures["POPUP_ID"],
+        "name": fixtures["POPUP_NAME"],
+        "seat": fixtures["POPUP_SEAT"],
+        "stats": fixtures["POPUP_STATS"],
+    }
+    bound = [{key: event.get(key) for key in expected} for event in events if event["type"] == "player_bound"]
+    if bound != [expected] or any(event["type"] == "recommendation" for event in events):
+        raise ValueError(f"Unexpected profile replay events: {events}")
+
+    player = json.loads(subprocess.check_output(
+        [executable, "players", "--db", database, "show", expected["player_id"], "--profiles", "1"],
+        cwd=folder, env=env, encoding="utf-8", timeout=30,
+    ))
+    history = player["profiles"]
+    if (not player["registered"] or player["player_id"] != expected["player_id"]
+            or len(history) != 1 or history[0]["name"] != expected["name"]
+            or history[0]["stats"] != expected["stats"] or player["club_profile"] != expected["stats"]):
+        raise ValueError(f"Unexpected saved player profile: {player}")
+
+
 def main(executable):
-    fixture = Path(__file__).resolve().parents[1] / "tests" / "test_windows_ocr.py"
-    fixture_helpers = runpy.run_path(str(fixture))
+    tests = Path(__file__).resolve().parents[1] / "tests"
+    fixture_helpers = runpy.run_path(str(tests / "test_windows_ocr.py"))
+    popup_fixtures = runpy.run_path(str(tests / "test_player_popup.py"))
     env = {key: value for key, value in os.environ.items()
            if key not in {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"}}
     with TemporaryDirectory(prefix="deep-stack-smoke-") as directory:
@@ -84,6 +117,7 @@ def main(executable):
         if values != ("Alice", 800, 420, "call", 20, 240, 220, "flop"):
             raise ValueError(f"Unexpected OCR state: {values}. Evidence: {frame['evidence']}")
         assert_live_replay(executable, folder, screenshot, fixture_helpers["_standard_font"], env)
+        assert_profile_replay(executable, folder, popup_fixtures, env)
 
 
 if __name__ == "__main__":

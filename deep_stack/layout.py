@@ -29,6 +29,11 @@ SEAT_IDS = tuple(seat[0] for seat in _SEATS)
 HERO_CARD_FIELDS = ("hero_card_0", "hero_card_1")
 BOARD_CARD_FIELDS = tuple(f"board_card_{index}" for index in range(5))
 HERO_BUTTON_FIELDS = ("hero_fold_button", "hero_passive_button", "hero_aggressive_button")
+POPUP_TEXT_FIELDS = ("player_popup", "player_popup_id", "player_popup_id_label", "player_popup_name")
+POPUP_NUMBER_FIELDS = (
+    "player_popup_id_value", "player_popup_hands", "player_popup_win_rate",
+    "player_popup_pot_entry_rate", "player_popup_showdown_win_rate",
+)
 
 _REGION_KINDS = {
     **{f"{seat}.{field}": kind for seat in SEAT_IDS for field, kind in (
@@ -37,7 +42,8 @@ _REGION_KINDS = {
     )},
     **dict.fromkeys(("pot", "center_pot"), "number"),
     **dict.fromkeys(HERO_CARD_FIELDS + BOARD_CARD_FIELDS, "card"),
-    **dict.fromkeys(HERO_BUTTON_FIELDS, "label"),
+    **dict.fromkeys(HERO_BUTTON_FIELDS + POPUP_TEXT_FIELDS, "label"),
+    **dict.fromkeys(POPUP_NUMBER_FIELDS, "number"),
 }
 _COORDINATES = ("x", "y", "width", "height")
 

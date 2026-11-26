@@ -10,7 +10,7 @@
 - 座位编号用于关联同一手牌的画面。余额是显示的剩余筹码，本轮投入和整手累计投入单独记录。动作日志只能记录采样到的变化。重复出现的同标签以及两帧之间的动作，需要用完整牌谱补齐。截图缩放、遮挡、动画和主题会影响识别，自动回归使用固定合成截图序列。
 - `wpk.com` 官网公开说明会打击伙牌和作弊。截至 2026 年 11 月 26 日，在官网及其新闻、下载、品牌等公开入口中尚未核实到对第三方实时辅助的官方条款。识别验证使用本地合成数据。[WPK 官网](https://www.wpk.com/) · [WPK H5](https://h5.wpk.com/)
 
-登录页面刷新时，浏览器开发者工具显示普通 Fetch/XHR 请求和一个握手状态为 `101` 的 `wss://` 长连接。协议观察尚未验证牌局事件的字段和对应关系，程序目前通过屏幕识别获取牌局信息。
+登录页面刷新时，浏览器开发者工具显示普通 Fetch/XHR 请求和两条握手状态为 `101` 的 `wss://` 连接。可在 Chrome 的 Network 面板勾选 Keep log，按 Socket 筛选，再选择连接的 Messages 查看时刻、方向和长度。一次现场观察中，一条连接显示了多条二进制消息，尚未核实这些消息与座位、筹码、动作或固定 ID 的对应关系。程序目前通过屏幕识别获取牌局信息。[Chrome Network 文档](https://developer.chrome.com/docs/devtools/network/reference/#websocket-messages)
 
 ## 安装与启动
 
@@ -21,7 +21,7 @@ GitHub Actions 的 `Test and build` 工作流为 Windows x64 和 macOS Apple Sil
 
 Windows 完整解压后若遇到 ONNX Runtime 的 DLL 加载错误，可核对系统是否有最新的 x64 Visual C++ v14 运行库。[ONNX Runtime 运行要求](https://onnxruntime.ai/docs/install/#requirements) · [Microsoft x64 运行库](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
-从源码运行时，推荐 Python 3.12。Windows 在项目目录运行 `python -m pip install ".[windows]"`，macOS 运行 `python3 -m pip install '.[live]'`，随后可使用 `deep-stack` 或 `python3 -m deep_stack`。macOS 源码版 OCR 使用 Vision 并依赖系统 Swift，两个平台的独立包都使用离线 RapidOCR。Windows OCR 和屏幕采集依赖的版本要求 Python 3.11 或更高，纯 EV 分析可用 Python 3.10。
+从源码运行时，推荐 Python 3.12。在项目目录运行 `python -m pip install ".[ocr]"`，随后可使用 `deep-stack` 或 `python3 -m deep_stack`。两个平台的独立包都使用离线 RapidOCR。macOS 源码版可改用 `.[live]` 和系统 Swift/Vision。Windows OCR 和屏幕采集依赖的版本要求 Python 3.11 或更高，纯 EV 分析可用 Python 3.10。
 
 以下命令用安装后的 `deep-stack` 举例。直接解压运行时使用对应平台的可执行文件路径。
 
@@ -56,14 +56,14 @@ deep-stack layout-template --live -o live-layout.json
 ## 连续观察和实时提示
 
 ```bash
-deep-stack live --interval 1 --max-age 2
+deep-stack live --session table-01
 deep-stack live --layout live-layout.json --model model.json --session table-01 --json
 deep-stack live --layout live-layout.json --frames first.png second.png --json
 ```
 
 `live` 从屏幕可见区域持续取帧，保持牌桌完整可见，用 `Ctrl+C` 停止。`--interval` 是采样间隔，`--max-age` 是可输出建议的最大帧龄，两者单位为秒。指定 `--frames` 时顺序回放本地图像。`--json` 按行输出事件，适合留档或接入本机界面。
 
-引擎需从倒计时确认轮到自己，并核对牌面、底池、活跃座位及相应动作的筹码信息，读数不足或过期时输出等待原因。会话中的已全下玩家和待确认边池需要转到状态文件复盘。默认可比较读数充分的过牌、跟注和弃牌。进攻动作还要求金额和对手应答模型。
+引擎需从倒计时确认轮到自己，并核对牌面、底池、活跃座位及相应动作的筹码信息，读数不足或过期时输出等待原因。会话中的已全下玩家和待确认边池需要转到状态文件复盘。默认可比较读数充分的过牌、跟注和弃牌。进攻动作还要求金额和对手应答模型。观战时会在可辨认同一手公共牌的情况下继续记录已绑定玩家的动作。
 
 `--model` 接收可选的 JSON 对象。使用内置 WPK 布局且省略 `--model` 时，默认采用已观察到的两行底池口径，并在每次识别时验算金额。指定自定义布局时，可在模型中明确写入需要的口径。
 
@@ -79,14 +79,14 @@ deep-stack live --layout live-layout.json --frames first.png second.png --json
 
 ## 按稳定玩家 ID 记录行为
 
-先从头像资料弹窗人工确认稳定数字 ID，再关联当前场次和座位。也可以截取弹窗内含 `ID:` 标签的整行，用 `read-id` 辅助读取后核对结果。玩家 ID 按字符串保存，保留前导零。
+启动 `live` 后，在网页手动依次打开玩家头像。弹窗保持可见，直到终端显示 ID 已读取或已绑定。程序连续两帧核对 ID，并在本桌画面能唯一定位昵称时绑定座位。同名、遮挡或读数冲突时，可用 `bind` 手动确认。也可以截取弹窗内含 ID 标识的整行，用 `read-id` 辅助读取。玩家 ID 按字符串保存，保留前导零。
 
 ```bash
 deep-stack players read-id profile-id.png
 deep-stack players --db players.sqlite3 bind table-01 right_upper 001234 --name 示例昵称
 deep-stack players --db players.sqlite3 bindings table-01
 deep-stack live --db players.sqlite3 --session table-01 --layout live-layout.json --json
-deep-stack players --db players.sqlite3 show 001234 --events 20
+deep-stack players --db players.sqlite3 show 001234 --events 20 --profiles 5
 deep-stack players --db players.sqlite3 unbind table-01 right_upper
 ```
 
@@ -94,7 +94,7 @@ deep-stack players --db players.sqlite3 unbind table-01 right_upper
 
 动作按场次、手牌、街次、座位和稳定 ID 存储。同一动作标签持续出现时去重，同街观察到不同金额的加注可分别记录。检测到座位空出或昵称变化时，暂停向原 ID 追加，重新核对弹窗后用 `bind` 恢复或登记新玩家。同名玩家保持独立，换座或换人请重新核对 ID。
 
-`show` 输出含可见动作的手牌数、按街动作数及本街可见投入的最小值、最大值和均值，金额是采样到的累计投入读数。`--events N` 附带最近 N 条可见动作。VPIP 和 PFR 需要已确认的完整翻前分母，普通截图会话中缺少该分母时返回 `null`。SQLite 文件保存在本机，实时模式处理完画面后丢弃图像。
+`show` 输出含可见动作的手牌数、按街动作数及本街可见投入的最小值、最大值和均值，金额是采样到的累计投入读数。`--events N` 附带最近 N 条可见动作。俱乐部弹窗的手数、胜率、入池率和摊牌胜率完整读到后，单独保存为画像，`--profiles N` 可查询最近的变化。VPIP 和 PFR 需要已确认的完整翻前分母，缺少该分母时返回 `null`。SQLite 文件保存在本机，实时模式处理完画面后丢弃图像。
 
 ## 分析状态 JSON
 

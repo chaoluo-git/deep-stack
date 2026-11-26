@@ -10,6 +10,7 @@ import unicodedata
 from uuid import uuid4
 
 from .ev import analyze
+from .player_popup import PlayerPopup, match_popup
 
 
 _SECONDS = re.compile(r"([1-9]\d?)\s*(?:s|秒)", re.IGNORECASE)
@@ -211,32 +212,89 @@ class HandTracker:
         if street not in _STREETS:
             self.candidate = None
             return None
-        if not cards:
+        hero = tuple(sorted(cards)) if cards else None
+        reset = self.street is not None and _STREETS.index(street) < _STREETS.index(self.street)
+        if hero is None and not (board or (reset and board == [])):
             self.candidate = None
-            if self.board and board is not None and board[:len(self.board)] == self.board:
-                self.board = board
-                self.street = street
-                return self.hand
             return None
-        hero = tuple(sorted(cards))
+        hero_changed = hero is not None and self.hero is not None and hero != self.hero
+        board_conflict = bool(board and board[:len(self.board)] != self.board)
         if self.hand is None:
             self.hand = uuid4().hex
-        elif hero != self.hero or _STREETS.index(street) < _STREETS.index(self.street):
+        elif hero_changed or reset or (hero is None and board_conflict):
             fingerprint = (hero, street, tuple(board or ()))
             if self.candidate != fingerprint:
                 self.candidate = fingerprint
                 return None
             self.hand = uuid4().hex
             self.board = []
-        elif board is not None and board[:len(self.board)] != self.board:
+            self.hero = None
+        elif board_conflict:
             self.candidate = None
             return None
         self.candidate = None
-        self.hero = hero
+        if hero is not None:
+            self.hero = hero
         self.street = street
         if board is not None:
             self.board = board
         return self.hand
+
+
+class PopupTracker:
+    """Two readings confirm a visible stable ID before it can change a binding."""
+
+    def __init__(self):
+        self.reference = None
+        self.candidate = None
+        self.saved = None
+
+    def update(self, frame, store, session, now):
+        vacant = set(frame.get("vacant_seats", []))
+        seats = [{**seat, "vacant": seat["seat"] in vacant} for seat in frame["seats"]]
+        if not frame.get("popup_open"):
+            self.reference = (now, frame.get("viewport"), seats)
+            self.candidate = self.saved = None
+            return None
+        raw = frame.get("player_popup")
+        if raw is None:
+            self.candidate = None
+            return {"type": "waiting", "message": "玩家资料已打开，等待读到唯一 ID"}
+        popup = PlayerPopup(**raw)
+        previous = ()
+        if self.reference and now - self.reference[0] <= 5 and self.reference[1] == frame.get("viewport"):
+            previous = self.reference[2]
+        seat = match_popup(popup, seats, previous_seats=previous)
+        key = (popup.player_id, popup.name, seat)
+        last = self.candidate
+        self.candidate = (key, popup.stats)
+        if last is None or last[0] != key:
+            return {"type": "waiting", "message": "正在复核弹窗 ID，请保持弹窗片刻"}
+
+        stats = {name: value for name, value in popup.stats.items() if last[1].get(name) == value}
+        snapshot = (key, stats)
+        if self.saved and self.saved[0] == snapshot:
+            return self.saved[1]
+        event = {"type": "player_profile", "player_id": popup.player_id, "name": popup.name,
+                 "seat": seat, "stats": stats}
+        if store is not None and len(stats) == 4:
+            store.save_profile(popup.player_id, name=popup.name, stats=stats)
+        if seat is None:
+            message = f"已读到 ID {popup.player_id}，座位未能唯一确认"
+        elif store is None:
+            message = f"已读到 {seat} 的 ID {popup.player_id}"
+        else:
+            try:
+                store.bind(session, seat, popup.player_id, name=popup.name)
+            except ValueError as error:
+                message = f"已读到 ID {popup.player_id}，绑定待处理：{error}"
+            else:
+                event["type"] = "player_bound"
+                message = f"已将 {seat} 绑定到玩家 ID {popup.player_id}"
+        event["message"] = message
+        event["fingerprint"] = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        self.saved = (snapshot, event)
+        return event
 
 
 def _emit(event, json_lines):
@@ -261,6 +319,8 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
 
     model = validate_model(model)
     tracker = HandTracker()
+    popups = PopupTracker()
+    last_viewport = None
     context = nullcontext()
     if database is not None:
         from .player_store import PlayerStore
@@ -277,40 +337,42 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
             started = monotonic()
             try:
                 frame = recognize(image, viewport=viewport, profile=profile,
-                                  auto_viewport=viewport is None, live=True)
+                                  auto_viewport=viewport is None, live=True, popup_fallback=last_viewport)
             except (OSError, ValueError) as error:
                 event = {"type": "waiting", "message": str(error)}
                 if frames:
                     raise
             else:
-                if store is not None and not frame.get("layout_mismatch") and (hand := tracker.update(frame)) is not None:
-                    registered = store.record_frame(session, hand, frame)
-                    paused = tuple(registered.get("paused", []))
-                    if paused and paused != last_log_status:
-                        _emit({"type": "binding_paused", "seats": paused,
-                               "message": f"需重新确认玩家 ID {'、'.join(paused)}"}, json_lines)
-                    last_log_status = paused
-                state, reason, seconds = _state(frame, model)
-                if reason:
-                    event = {"type": "waiting", "message": reason}
-                else:
-                    fingerprint = json.dumps(state, ensure_ascii=False, sort_keys=True)
-                    if previous != ("recommendation", fingerprint):
-                        try:
-                            analysis = analyze(state, samples=samples)
-                        except ValueError as error:
-                            event = {"type": "waiting", "message": f"状态校验未通过：{error}"}
-                        else:
-                            event = {"type": "recommendation", "analysis": analysis}
-                    else:
-                        event = {"type": "recommendation"}
-                    event["fingerprint"] = fingerprint
-                    if monotonic() - started >= min(max_age, seconds):
-                        event = {"type": "waiting", "message": "本次读数已超时"}
+                last_viewport = frame.get("viewport") or last_viewport
+                event = popups.update(frame, store, session, monotonic())
+                if event is None:
+                    if store is not None and (hand := tracker.update(frame)) is not None:
+                        registered = store.record_frame(session, hand, frame)
+                        paused = tuple(registered.get("paused", []))
+                        if paused and paused != last_log_status:
+                            _emit({"type": "binding_paused", "seats": paused,
+                                   "message": f"需重新确认玩家 ID {'、'.join(paused)}"}, json_lines)
+                        last_log_status = paused
+                    event = _decision_event(frame, model, samples, previous, started, max_age)
             key = (event["type"], event.get("fingerprint", event.get("message")))
             if key != previous:
-                event.pop("fingerprint", None)
-                _emit(event, json_lines)
+                _emit({key: value for key, value in event.items() if key != "fingerprint"}, json_lines)
                 previous = key
             if not frames:
                 sleep(max(0.0, interval - (monotonic() - started)))
+
+
+def _decision_event(frame, model, samples, previous, started, max_age):
+    state, reason, seconds = _state(frame, model)
+    if reason:
+        return {"type": "waiting", "message": reason}
+    fingerprint = json.dumps(state, ensure_ascii=False, sort_keys=True)
+    event = {"type": "recommendation", "fingerprint": fingerprint}
+    if previous != ("recommendation", fingerprint):
+        try:
+            event["analysis"] = analyze(state, samples=samples)
+        except ValueError as error:
+            return {"type": "waiting", "message": f"状态校验未通过：{error}"}
+    if monotonic() - started >= min(max_age, seconds):
+        return {"type": "waiting", "message": "本次读数已超时"}
+    return event

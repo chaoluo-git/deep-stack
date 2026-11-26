@@ -100,6 +100,7 @@ def _parser():
     show = player_commands.add_parser("show", help="查询玩家统计")
     show.add_argument("id")
     show.add_argument("--events", type=int, metavar="N", help="附带最近 N 条动作")
+    show.add_argument("--profiles", type=int, metavar="N", help="附带最近 N 条俱乐部公开画像")
     read_id = player_commands.add_parser("read-id", help="从已裁到 ID 行的头像弹窗截图读取 ID")
     read_id.add_argument("image", type=Path)
     read_id.add_argument("--viewport", type=_viewport, metavar="X,Y,W,H")
@@ -195,6 +196,8 @@ def _players(args):
         result = store.stats(args.id)
         if args.events is not None:
             result["events"] = store.events(args.id, limit=args.events)
+        if args.profiles is not None:
+            result["profiles"] = store.profiles(args.id, limit=args.profiles)
         return result
 
 

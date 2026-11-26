@@ -2,11 +2,13 @@ from contextlib import redirect_stdout
 from copy import deepcopy
 from io import StringIO
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 from deep_stack.ev import analyze
-from deep_stack.live import HandTracker, _state, scan_live
+from deep_stack.live import HandTracker, PopupTracker, _state, scan_live
 
 
 _HERO = ["As", "Ks"]
@@ -114,6 +116,16 @@ class LiveDecisionTests(unittest.TestCase):
 
 
 class HandTrackerTests(unittest.TestCase):
+    def test_observing_another_table_can_track_visible_postflop_actions(self):
+        tracker = HandTracker()
+        flop = frame()
+        flop["street"], flop["board"], flop["hero_cards"] = "flop", _RIVER[:3], None
+        hand = tracker.update(flop)
+        self.assertIsNotNone(hand)
+        turn = frame()
+        turn["street"], turn["board"], turn["hero_cards"] = "turn", _RIVER[:4], None
+        self.assertEqual(tracker.update(turn), hand)
+
     def test_keeps_recording_after_hero_cards_become_unreadable(self):
         tracker = HandTracker()
         flop = frame()
@@ -155,3 +167,30 @@ class HandTrackerTests(unittest.TestCase):
         unreadable["hero_cards"] = None
         self.assertIsNone(tracker.update(unreadable))
         self.assertEqual(tracker.update(new), new_hand)
+
+
+class PopupTrackerTests(unittest.TestCase):
+    def test_keeps_leading_zero_and_binds_after_two_consistent_readings(self):
+        from deep_stack.player_store import PlayerStore
+
+        tracker = PopupTracker()
+        visible = {"seats": [{"seat": "right_upper", "name": "Study Player"}], "viewport": [0, 0, 1512, 735]}
+        popup_frame = {
+            **visible,
+            "seats": [{"seat": "right_upper", "name": None}],
+            "popup_open": True,
+            "player_popup": {
+                "player_id": "001234", "name": "Study Player",
+                "stats": {"hands": 300, "win_rate": 0.2, "pot_entry_rate": 0.42, "showdown_win_rate": 0.5},
+            },
+        }
+        with TemporaryDirectory() as folder, PlayerStore(Path(folder) / "players.sqlite3") as store:
+            self.assertIsNone(tracker.update(visible, store, "study", 1))
+            self.assertEqual(tracker.update(popup_frame, store, "study", 2)["type"], "waiting")
+            self.assertEqual(store.bindings("study"), [])
+            event = tracker.update(popup_frame, store, "study", 3)
+            self.assertEqual((event["type"], event["seat"], event["player_id"]),
+                             ("player_bound", "right_upper", "001234"))
+            self.assertEqual(store.stats("001234")["club_profile"]["pot_entry_rate"], 0.42)
+            self.assertEqual(tracker.update(popup_frame, store, "study", 4), event)
+            self.assertEqual(len(store.profiles("001234")), 1)

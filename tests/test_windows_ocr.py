@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from deep_stack.layout import default_profile, pixel_regions
-from deep_stack.windows_ocr import WindowsOCRError, read_fields
+from deep_stack.windows_ocr import WindowsOCRError, _generic_suit, read_fields
 
 
 _HAS_OCR = all(find_spec(name) is not None for name in ("rapidocr", "onnxruntime", "PIL"))
@@ -26,8 +26,6 @@ _CARDS = {
     "board_card_1": "2c",
     "board_card_2": "Qc",
 }
-_SYMBOL = {"s": "♠", "h": "♥", "d": "♦", "c": "♣"}
-
 
 def _font(paths, size):
     from PIL import ImageFont
@@ -43,17 +41,7 @@ def _font(paths, size):
 def _standard_font(size):
     from PIL import ImageFont
 
-    return _font(("arialbd.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"), size) or (
-        ImageFont.load_default(size)
-    )
-
-
-def _symbol_font(size):
-    return _font((
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "seguisym.ttf",
-        "/System/Library/Fonts/Apple Symbols.ttf",
-        "DejaVuSans.ttf",
-    ), size)
+    return ImageFont.load_default(size)
 
 
 def _chinese_font(size):
@@ -86,19 +74,14 @@ def write_ocr_fixture(path, *, size=(1512, 735), header=0, chinese=False):
         x, y, w, h = regions[name]
         draw.rectangle((x, y, x + w - 1, y + h - 1), fill="#fcfcfc")
         rank, suit = card
-        symbol_font = _symbol_font(max(12, round(h * 0.38)))
         color = "#cc1538" if suit in {"d", "h"} else "#151515"
-        if symbol_font is None:
-            draw.text((x + w // 2, y + h // 4), card, font=_standard_font(max(11, round(h * 0.31))),
-                      fill=color, anchor="mm")
-            continue
-        draw.text((x + round(w * 0.24), y + round(h * 0.16)), rank,
-                  font=_standard_font(max(12, round(h * 0.31))), fill=color, anchor="mm")
-        symbol = _SYMBOL[suit]
-        left, top, right, bottom = draw.textbbox((0, 0), symbol, font=symbol_font)
-        center_x, center_y = x + w * 0.24, y + h * 0.44
-        draw.text((center_x - (left + right) / 2, center_y - (top + bottom) / 2),
-                  symbol, font=symbol_font, fill=color)
+        font = _standard_font(max(12, round(h * 0.32)))
+        left, top, right, bottom = draw.textbbox((0, 0), rank, font=font)
+        draw.text((x + w * 0.24 - (left + right) / 2, y + h * 0.16 - (top + bottom) / 2),
+                  rank, font=font, fill=color)
+        size = min(round(w * 0.43), round(h * 0.30))
+        shape = _generic_suit(suit, (size, size)).point([0] * 128 + [255] * 128)
+        screenshot.paste(color, (round(x + w * 0.24 - size / 2), round(y + h * 0.44 - size / 2)), shape)
     screenshot.save(path)
 
 
@@ -125,9 +108,9 @@ class PortableOCRTests(unittest.TestCase):
                 self.assertEqual((table["pot"], table["center_pot"]), (240, 220))
                 self.assertTrue(fields["board_card_4"]["empty_felt"])
                 self.assertEqual(table["street"], "flop")
-                if _symbol_font(18) is not None:
-                    self.assertEqual(table["hero_cards"], ["As", "Kh"])
-                    self.assertEqual(table["board"], ["7d", "2c", "Qc"])
+                cards = {key: value for key, value in fields.items() if "_card_" in key}
+                self.assertEqual(table["hero_cards"], ["As", "Kh"], cards)
+                self.assertEqual(table["board"], ["7d", "2c", "Qc"], cards)
 
     def test_reads_chinese_with_cpu_model(self):
         from deep_stack.recognition import _table_state

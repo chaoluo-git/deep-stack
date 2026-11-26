@@ -105,6 +105,31 @@ def _ink_mask(mask):
     return np.asarray(shape, dtype=bool)
 
 
+def _generic_suit(suit, size):
+    """Draw a generic playing-card pip, independent of installed fonts."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("L", (64, 64))
+    draw = ImageDraw.Draw(image)
+    heart = [(8, 23), (9, 16), (14, 10), (21, 8), (27, 10), (32, 16),
+             (37, 10), (43, 8), (50, 10), (55, 16), (56, 23), (52, 32),
+             (43, 43), (32, 55), (21, 43), (12, 32)]
+    stem = [(29, 35), (35, 35), (35, 47), (38, 52), (43, 56),
+            (21, 56), (26, 52), (29, 47)]
+    if suit == "h":
+        draw.polygon(heart, fill=255)
+    elif suit == "d":
+        draw.polygon([(32, 5), (54, 32), (32, 59), (10, 32)], fill=255)
+    elif suit == "s":
+        draw.polygon(stem, fill=255)
+        draw.polygon([(x, 59 - y) for x, y in heart], fill=255)
+    elif suit == "c":
+        draw.polygon(stem, fill=255)
+        for box in ((21, 6, 43, 29), (8, 22, 32, 45), (32, 22, 56, 45)):
+            draw.ellipse(box, fill=255)
+    return image.resize(size, Image.Resampling.LANCZOS)
+
+
 @lru_cache(maxsize=1)
 def _suit_masks():
     import numpy as np
@@ -116,22 +141,31 @@ def _suit_masks():
         Path("/System/Library/Fonts/Apple Symbols.ttf"),
         "DejaVuSans.ttf",
     )
+    sizes = (12, 14, 18, 20, 22, 24, 26, 32, 40, 48, 64)
+    masks = {suit: [] for suit in _SUIT_SYMBOLS}
+    for suit, variants in masks.items():
+        for size in range(9, 33):
+            shape = _ink_mask(np.asarray(_generic_suit(suit, (size, size))) >= 128)
+            if shape is not None:
+                variants.append(shape)
     for name in candidates:
-        masks = {suit: [] for suit in _SUIT_SYMBOLS}
+        font_masks = {suit: [] for suit in _SUIT_SYMBOLS}
         try:
-            for size in (14, 18, 20, 22, 24, 26, 32, 40, 48, 64):
+            for size in sizes:
                 font = ImageFont.truetype(str(name), size)
                 for suit, symbol in _SUIT_SYMBOLS.items():
                     image = Image.new("L", (100, 100))
                     ImageDraw.Draw(image).text((50, 50), symbol, font=font, fill=255, anchor="mm")
                     mask = _ink_mask(np.asarray(image) >= 128)
                     if mask is not None:
-                        masks[suit].append(mask)
+                        font_masks[suit].append(mask)
         except OSError:
             continue
-        if all(masks.values()):
-            return {suit: np.stack(variants) for suit, variants in masks.items()}
-    return {}
+        if all(font_masks.values()):
+            for suit, variants in font_masks.items():
+                masks[suit].extend(variants)
+            break
+    return {suit: np.stack(variants) for suit, variants in masks.items()}
 
 
 def _match_suit(image):
