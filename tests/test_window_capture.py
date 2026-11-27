@@ -43,6 +43,14 @@ class WindowSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(WindowCaptureError, "多个 WePoker 窗口"):
             self.find(window(1), window(2))
 
+    def test_extension_collector_does_not_hide_or_duplicate_a_game_window(self):
+        collector = window(1, title="WPK 帧采集")
+        suffixed = window(2, title="WPK 帧采集 - Google Chrome")
+        self.assertIsNone(self.find(collector, suffixed))
+        self.assertEqual(self.find(collector, suffixed, window(3)), 3)
+        with self.assertRaisesRegex(WindowCaptureError, "多个 WePoker 窗口"):
+            self.find(collector, window(3), window(4, title="WPK 牌桌"))
+
     def test_missing_title_does_not_select_arbitrary_chrome_window(self):
         self.assertIsNone(self.find(window(1, title=None)))
         self.assertEqual(self.find(window(2, owner="WePoker", title=None)), 2)

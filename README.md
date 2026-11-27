@@ -37,6 +37,18 @@ Chrome 118 或以上可在 `chrome://extensions` 加载未打包的扩展，源�
 
 接收程序只监听 `127.0.0.1`。扩展在本地生成帧的时间、方向、操作码、字节数与编码标签，HTTP 批次只带这些元数据和匿名标识。配对令牌由本地文件提供，监听停止后配对失效。终端会把满足周期和延迟条件的往返标为「可能是保活或轮询」。可用 `h5-inspect --patterns` 对已导出的文件做同样的检测。牌局事件仍需要可验证的字段映射后才能进入 EV 分析。[CDP WebSocket 帧定义](https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-WebSocketFrame)
 
+
+### 同时记录 H5 帧和可见动作
+
+观战时启动双源校准，再按上一节在 Chrome 扩展中选择这一轮的配对文件并点击「开始」。每次采集使用新的 JSONL 文件。结束前先停止扩展，也可用 `Ctrl+C` 停止程序。8 座和 9 座默认自动识别，需要手动标定时可用 `--table-seats 8` 或 `--table-seats 9`。有多张牌桌时，macOS 可以用 `--window-id ID` 固定目标。
+
+```bash
+deep-stack h5-calibrate table-trial.jsonl --spectate --seconds 120
+deep-stack h5-correlate table-trial.jsonl --window-ms 1500 -o table-trial-correlation.json
+```
+
+时间轴保留 WSS 帧的元数据和浏览器相对时间、批次在本机的接收时间，以及可见座位动作和公共牌的截图采样时刻。报告为每个画面标记统计可能相关的帧数。时间相邻仅提供核验线索。需要关联稳定玩家 ID 时，可显式指定 `--db players.sqlite3 --session table-01` 启用独立的本机玩家记录，校准文件仍只保留座位和匿名手牌标识。生产字段、Hand2Note 的可用范围及验收条件见[动作采集规范](docs/h5-action-collection.md)。
+
 ## 安装与启动
 
 GitHub Actions 的 `Test and build` 工作流为 Windows x64 和 macOS Apple Silicon 构建独立运行包。构建测试成功后，打开对应运行记录，在 Artifacts 中下载所用平台的文件。包中含 Python 运行时、离线 OCR 模型和依赖，解压后请保留可执行文件与随包目录的相对位置。[GitHub Actions](https://github.com/chaoluo-git/deep-stack/actions/workflows/build.yml)

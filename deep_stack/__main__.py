@@ -1,6 +1,7 @@
 """Command-line entry points for observation, review and EV analysis."""
 
 import argparse
+from contextlib import contextmanager
 import json
 import math
 from pathlib import Path
@@ -59,6 +60,12 @@ def _add_window(parser):
                         help="指定 macOS 窗口 ID，默认优先捕捉 WePoker-H5")
 
 
+def _add_h5_listener(parser, default_port):
+    parser.add_argument("--port", type=int, default=default_port, help="本机监听端口，0 表示自动选择")
+    parser.add_argument("--pair-file", type=Path, help="指定配对文件位置，默认在本机临时目录创建")
+    parser.add_argument("--json", action="store_true", help="逐行输出 JSON 事件")
+
+
 def _parser():
     parser = argparse.ArgumentParser(description="从本地牌桌截图提取观察记录并复盘筹码 EV。")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -79,9 +86,24 @@ def _parser():
     _add_output(h5)
 
     h5_live = commands.add_parser("h5-live", help="接收 Chrome 扩展的实时 WebSocket 消息摘要")
-    h5_live.add_argument("--port", type=int, default=8767, help="本机监听端口，0 表示自动选择")
-    h5_live.add_argument("--pair-file", type=Path, help="指定配对文件位置，默认在本机临时目录创建")
-    h5_live.add_argument("--json", action="store_true", help="逐行输出 JSON 事件")
+    _add_h5_listener(h5_live, 8767)
+
+    calibration = commands.add_parser("h5-calibrate", help="在同一时间轴上采集 H5 帧和可见牌局动作")
+    calibration.add_argument("timeline", type=Path, metavar="TIMELINE", help="创建新的匿名校准 JSONL 文件")
+    _add_h5_listener(calibration, 0)
+    _add_layout(calibration)
+    _add_window(calibration)
+    calibration.add_argument("--spectate", action="store_true", help="观战模式，底部座位视为普通玩家")
+    calibration.add_argument("--table-seats", type=int, choices=(8, 9), help="指定实体座位数量，默认自动判断")
+    calibration.add_argument("--interval", type=float, default=0.75, help="屏幕采样间隔秒数")
+    calibration.add_argument("--seconds", type=float, help="采集多少秒后停止，默认运行到 Ctrl+C")
+    calibration.add_argument("--db", type=Path, help="可选的本机已核验玩家动作数据库")
+    calibration.add_argument("--session", help="可选的数据库牌桌会话 ID")
+
+    correlation = commands.add_parser("h5-correlate", help="为可见行动查找时间相近的 H5 消息候选")
+    correlation.add_argument("timeline", type=Path, metavar="TIMELINE", help="h5-calibrate 的 JSONL 文件")
+    correlation.add_argument("--window-ms", type=int, default=1500, help="事件前后的候选窗口毫秒数")
+    _add_output(correlation)
 
     layout = commands.add_parser("layout-template", help="导出按位置比例配置的布局模板")
     layout.add_argument("--live", action="store_true", help="包含实时座位标记和按钮区域")
@@ -226,6 +248,15 @@ def _players(args):
         return result
 
 
+@contextmanager
+def _h5_pairing_file(path):
+    if path is not None:
+        yield path.expanduser()
+    else:
+        with TemporaryDirectory(prefix="deep-stack-h5-") as folder:
+            yield Path(folder) / "h5-pairing.json"
+
+
 def _run_h5_live(args):
     from .h5_live import serve_live
     from .h5_traffic import TrafficAnalyzer
@@ -248,15 +279,89 @@ def _run_h5_live(args):
             else:
                 print(pattern["message"], flush=True)
 
-    if args.pair_file is not None:
-        return serve_live(args.port, args.pair_file.expanduser(), emit)
-    with TemporaryDirectory(prefix="deep-stack-h5-") as folder:
-        return serve_live(args.port, Path(folder) / "h5-pairing.json", emit)
+    with _h5_pairing_file(args.pair_file) as pairing:
+        return serve_live(args.port, pairing, emit)
+
+
+def _run_h5_calibrate(args):
+    from threading import Thread
+    from time import monotonic
+
+    from .h5_calibration import CalibrationRecorder
+    from .h5_live import live_server
+    from .layout import load_profile
+    from .live import scan_live
+
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        raise ValueError("采样间隔须为正数")
+    if args.seconds is not None and (not math.isfinite(args.seconds) or args.seconds <= 0):
+        raise ValueError("采集持续时间须为正数")
+    if args.window_id is not None and (sys.platform != "darwin" or not 1 <= args.window_id <= 2**32 - 1):
+        raise ValueError("--window-id 需要 macOS 的正整数窗口 ID")
+
+    timeline = args.timeline.expanduser()
+    database = args.db.expanduser() if args.db is not None else None
+    profile = load_profile(args.layout.expanduser()) if args.layout else None
+    listening = None
+    failure = None
+
+    def receive(event):
+        nonlocal listening, failure
+        if event["type"] == "listening":
+            listening = event
+        else:
+            try:
+                journal.h5(event)
+            except Exception as error:
+                failure = error
+                raise
+
+    def should_stop():
+        if failure is not None:
+            raise failure
+        return deadline is not None and monotonic() >= deadline
+
+    with _h5_pairing_file(args.pair_file) as pairing:
+        paths = [path.resolve() for path in (timeline, pairing, database) if path is not None]
+        if len(set(paths)) != len(paths):
+            raise ValueError("校准时间轴、配对文件和数据库需要不同路径")
+        with live_server(args.port, pairing, receive) as server, CalibrationRecorder(timeline) as journal:
+            if args.json:
+                print(json.dumps({**listening, "timeline": str(timeline)}, ensure_ascii=False), flush=True)
+            else:
+                print(f"H5 本机监听 {listening['url']}\n配对文件 {listening['pairing_file']}\n校准时间轴 {timeline}",
+                      flush=True)
+            deadline = monotonic() + args.seconds if args.seconds is not None else None
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                scan_live(frames=None, viewport=args.viewport, profile=profile, model={}, samples=1500,
+                          interval=args.interval, max_age=3, json_lines=args.json, database=database,
+                          session=args.session or uuid4().hex[:12], window_id=args.window_id,
+                          force_spectator=args.spectate, seat_capacity=args.table_seats,
+                          show_actions=True, show_board=True, observe_only=True,
+                          on_observation=journal.screen, should_stop=should_stop)
+            finally:
+                server.shutdown()
+                thread.join()
+            if failure is not None:
+                raise failure
 
 
 def _run(args):
     if args.command == "h5-live":
         return _run_h5_live(args)
+    if args.command == "h5-calibrate":
+        return _run_h5_calibrate(args)
+    if args.command == "h5-correlate":
+        from .h5_correlate import correlate_timeline
+
+        timeline = args.timeline.expanduser()
+        if args.output is not None:
+            args.output = args.output.expanduser()
+            if args.output.resolve() == timeline.resolve():
+                raise ValueError("H5 对照报告需要与原始时间轴使用不同文件")
+        return correlate_timeline(timeline, window_ms=args.window_ms)
     if args.command == "h5-inspect":
         from .h5_trace import inspect_trace
 
@@ -336,7 +441,7 @@ def main(argv=None):
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     except (KeyboardInterrupt, subprocess.TimeoutExpired):
-        if args.command in {"live", "h5-live"}:
+        if args.command in {"live", "h5-live", "h5-calibrate"}:
             return 0
         print("操作已中断或超时。", file=sys.stderr)
         return 130

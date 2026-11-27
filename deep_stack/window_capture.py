@@ -14,12 +14,23 @@ _CHROME_OWNERS = frozenset((
 ))
 _WPK_OWNERS = frozenset(("wepoker", "wepoker-h5", "wpk"))
 _WPK_TITLE = re.compile(r"^(?:wepoker|wpk|h5\.wpk\.com)(?:$|[\s\-–—:|])", re.IGNORECASE)
+_COLLECTOR_TITLE = re.compile(
+    r"WPK 帧采集(?:\s*[-–—]\s*(?:Google Chrome|Chromium|Microsoft Edge)(?: (?:Beta|Dev|Canary))?)?",
+    re.IGNORECASE,
+)
 _ON_SCREEN_WINDOWS = (1 << 0) | (1 << 4)
 _PLIST_XML = 100
 
 
 class WindowCaptureError(OSError):
     """The target window is ambiguous or its contents could not be captured."""
+
+
+def _is_wpk_title(title):
+    if not isinstance(title, str):
+        return False
+    title = title.strip()
+    return bool(_WPK_TITLE.match(title) and not _COLLECTOR_TITLE.fullmatch(title))
 
 
 def _onscreen_windows():
@@ -77,8 +88,7 @@ def _wpk_window_id(entries):
             continue
         owner = owner.strip().casefold()
         if owner not in _WPK_OWNERS:
-            title = entry.get("kCGWindowName")
-            if owner not in _CHROME_OWNERS or not isinstance(title, str) or not _WPK_TITLE.match(title.strip()):
+            if owner not in _CHROME_OWNERS or not _is_wpk_title(entry.get("kCGWindowName")):
                 continue
 
         window_id = entry.get("kCGWindowNumber")

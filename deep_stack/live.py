@@ -465,7 +465,8 @@ def _emit(event, json_lines):
 
 def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
               json_lines, database=None, session=None, window_id=None,
-              force_spectator=False, seat_capacity=None, show_actions=False, show_board=False, scan_avatars=False):
+              force_spectator=False, seat_capacity=None, show_actions=False, show_board=False, scan_avatars=False,
+              observe_only=False, on_observation=None, should_stop=None):
     from .avatar_match import avatars_conflict
     from .live_actions import ActionLog
     from .live_board import BoardLog
@@ -499,7 +500,7 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
         if store is not None:
             _emit({"type": "session", "session": session,
                    "message": f"玩家记录会话 {session}，数据库 {Path(database)}"}, json_lines)
-        while True:
+        while should_stop is None or not should_stop():
             started = monotonic()
             try:
                 if source is None:
@@ -516,6 +517,7 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
                         capture.previous_window = captured_window
                 else:
                     image, captured_window = next(source), None
+                sampled_at = monotonic() if on_observation is not None else None
                 frame = recognize(image, viewport=viewport, profile=profile,
                                   auto_viewport=viewport is None, live=True, popup_fallback=last_viewport,
                                   window_capture=captured_window is not None,
@@ -581,6 +583,8 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
                                    "message": f"需重新确认玩家 ID {'、'.join(paused)}"}, json_lines)
                         last_log_status = paused
                     if show_board and (board_event := boards.update(frame, hand)) is not None:
+                        if on_observation is not None:
+                            on_observation(board_event, captured_at=sampled_at, sample_started_at=started)
                         _emit(board_event, json_lines)
                     if show_actions:
                         if (table_event := tables.update(frame, hand)) is not None:
@@ -590,8 +594,13 @@ def scan_live(*, frames, viewport, profile, model, samples, interval, max_age,
                             if (stack := stacks.get(action["seat"])) is not None:
                                 action["stack"] = stack
                                 action["message"] += f"｜余额 {stack:g}"
+                            if on_observation is not None:
+                                on_observation(action, captured_at=sampled_at, sample_started_at=started)
                             _emit(action, json_lines)
-                    event = _decision_event(frame, model, samples, previous, started, max_age)
+                    if observe_only:
+                        event = {"type": "observing", "message": "正在采集可见动作和公共牌"}
+                    else:
+                        event = _decision_event(frame, model, samples, previous, started, max_age)
                 if scanner is not None and captured_window is not None and not awaiting_layout:
                     scan_event = scanner.step(
                         frame, window_id=captured_window, image_size=image.size,

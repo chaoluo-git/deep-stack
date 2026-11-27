@@ -131,6 +131,20 @@ class NativeVerificationTests(unittest.TestCase):
                 self.assertFalse(self.native.unobscured(self.target, (40, 30)))
                 check.return_value = original
 
+    def test_extension_collector_is_rejected_as_a_foreground_browser_target(self):
+        self.native.foreground = Mock(return_value=17)
+        self.native.is_enabled = Mock(return_value=True)
+        self.native.window_class = Mock()
+        for title in ("WPK 帧采集", "WPK 帧采集 - Google Chrome", "WPK 帧采集 — Microsoft Edge"):
+            with self.subTest(title=title):
+                def write_title(_hwnd, output, _capacity):
+                    output.value = title
+                    return len(title)
+
+                self.native.window_text = Mock(side_effect=write_title)
+                self.assertIsNone(self.native.current_target(17))
+        self.native.window_class.assert_not_called()
+
     def test_checks_overlapping_z_order_even_if_the_native_hit_ignores_an_overlay(self):
         self.native.window_above.side_effect = [99, None]
 

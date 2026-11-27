@@ -237,6 +237,45 @@ def assert_h5_capture(executable, folder, env):
                 process.wait()
 
 
+def assert_h5_correlation(executable, folder, env):
+    from deep_stack.h5_calibration import CalibrationRecorder
+
+    help_output = subprocess.check_output([executable, "h5-calibrate", "--help"], cwd=folder, env=env,
+                                          encoding="utf-8", timeout=30)
+    if not all(option in help_output for option in ("TIMELINE", "--pair-file", "--seconds")):
+        raise ValueError("Standalone H5 calibration options are missing.")
+
+    timeline = folder / "anonymous-timeline.jsonl"
+    private = "synthetic-private-field"
+    clock = iter((100.0, 101.0)).__next__
+    with CalibrationRecorder(timeline, clock=clock) as recorder:
+        recorder.h5({"type": "frames", "capture_id": str(uuid4()), "batch_id": str(uuid4()), "frames": [{
+            "connection": "ws-1", "offset_ms": 36, "direction": "received", "opcode": 2,
+            "size_bytes": 63, "encoding": "binary", "payloadData": private,
+        }]})
+        recorder.screen({"type": "action", "street": "flop", "seat": "right_lower", "position": "HJ",
+                         "action": "bet", "wager": 12, "hand_id": "fixture-hand", "confirmed_hand": True,
+                         "player_id": private}, captured_at=100.98, sample_started_at=100.96)
+        recorder.screen({"type": "board", "street": "turn", "cards": ["As", "Kc", "6d", "Th"],
+                         "complete": True, "hand_id": "fixture-hand"}, captured_at=102.0)
+
+    report = run_command(executable, folder, env, "h5-correlate", timeline, "--window-ms", "30")
+    action, board = report["markers"]
+    candidate, = action["candidates"]
+    if (report["source"]["frame_count"] != 1 or report["summary"]["screen_action"]["single"] != 1
+            or report["summary"]["screen_board"]["none"] != 1):
+        raise ValueError("Unexpected H5 candidate totals in standalone correlation.")
+    if (action["candidate_status"] != "single" or action["candidate_frame_count"] != 1
+            or action["position"] != "HJ" or action["sample_started_ms"] != 960):
+        raise ValueError("The visible H5 calibration action did not retain its observed timing or position.")
+    if (candidate["size_bytes"] != 63 or candidate["arrival_delta_ms"] != 20
+            or board["candidate_status"] != "none" or report["method"]["application_message_mapping"] is not None):
+        raise ValueError("Unexpected H5 timing candidate in standalone correlation.")
+    for output in (timeline.read_text(encoding="utf-8"), json.dumps(report)):
+        if any(value in output for value in (private, "payloadData", "player_id", "fixture-hand")):
+            raise ValueError("Standalone H5 correlation exposed an excluded field.")
+
+
 def main(executable):
     tests = Path(__file__).resolve().parents[1] / "tests"
     fixture_helpers = runpy.run_path(str(tests / "test_windows_ocr.py"))
@@ -252,6 +291,7 @@ def main(executable):
             raise ValueError(f"Unexpected EV recommendation: {recommendation}")
 
         assert_h5_capture(executable, folder, env)
+        assert_h5_correlation(executable, folder, env)
         screenshot = folder / "牌桌.png"
         fixture_helpers["write_ocr_fixture"](screenshot)
         observation = run_command(executable, folder, env, "observe", screenshot)

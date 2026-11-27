@@ -10,7 +10,7 @@ from functools import lru_cache
 import ntpath
 import sys
 
-from .window_capture import WindowCaptureError, _WPK_TITLE
+from .window_capture import WindowCaptureError, _is_wpk_title
 from .window_input import WindowInputError, _bind, _finite_number
 
 
@@ -150,7 +150,7 @@ class _Win32:
         window_class = ctypes.create_unicode_buffer(256)
         length = self.window_text(hwnd, title, len(title))
         if (
-            not 0 < length < len(title) - 1 or not _WPK_TITLE.match(title.value.strip())
+            not 0 < length < len(title) - 1 or not _is_wpk_title(title.value)
             or not self.window_class(hwnd, window_class, len(window_class))
             or window_class.value != "Chrome_WidgetWin_1"
         ):
