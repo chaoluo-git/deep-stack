@@ -16,6 +16,7 @@ from uuid import UUID
 
 _HOST = "127.0.0.1"
 _ROUTE = "/v1/frames"
+_PUBLIC_ROUTE = "/v1/public"
 _MAX_BATCH_BYTES = 64 * 1024
 _MAX_FRAMES = 128
 _MAX_REMEMBERED_BATCHES = 4096
@@ -76,23 +77,39 @@ def _batch(body):
     return _uuid(payload["capture_id"]), _uuid(payload["batch_id"]), frames
 
 
+def _public_batch(body):
+    from .h5_public import MAX_PUBLIC_SNAPSHOTS, validate_snapshot
+
+    payload = json.loads(body.decode("utf-8"), object_pairs_hook=_without_duplicate_keys)
+    if not isinstance(payload, dict) or payload.keys() != {"capture_id", "batch_id", "snapshots"}:
+        raise ValueError("invalid public batch fields")
+    snapshots = payload["snapshots"]
+    if not isinstance(snapshots, list) or not 1 <= len(snapshots) <= MAX_PUBLIC_SNAPSHOTS:
+        raise ValueError("invalid public snapshot count")
+    return _uuid(payload["capture_id"]), _uuid(payload["batch_id"]), [validate_snapshot(x) for x in snapshots]
+
+
 class _Receiver(HTTPServer):
-    def __init__(self, port, token, emit):
+    def __init__(self, port, token, emit, *, public=False):
         self.authorization = f"Bearer {token}".encode("ascii")
         self.emit = emit
         self.batches = OrderedDict()
+        self.route = _PUBLIC_ROUTE if public else _ROUTE
+        self.batch_parser = _public_batch if public else _batch
+        self.batch_field = "snapshots" if public else "frames"
         super().__init__((_HOST, port), _Handler)
 
-    def accept(self, capture_id, batch_id, frames):
+    def accept(self, capture_id, batch_id, items):
         identity = (capture_id, batch_id)
-        fingerprint = sha256(json.dumps(frames, sort_keys=True, separators=(",", ":")).encode()).digest()
+        fingerprint = sha256(json.dumps(items, sort_keys=True, separators=(",", ":")).encode()).digest()
         previous = self.batches.get(identity)
         if previous is not None:
             self.batches.move_to_end(identity)
             old_fingerprint, status = previous
             return status if compare_digest(old_fingerprint, fingerprint) else 409
         try:
-            self.emit({"type": "frames", "capture_id": capture_id, "batch_id": batch_id, "frames": frames})
+            self.emit({"type": self.batch_field, "capture_id": capture_id, "batch_id": batch_id,
+                       self.batch_field: items})
         except Exception:
             # A callback can fail after an observable side effect. Retain the
             # failed outcome for an identical retry instead of calling it twice.
@@ -140,7 +157,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._discard_rejected_body()
 
     def _check_endpoint(self):
-        if self.path != _ROUTE:
+        if self.path != self.server.route:
             self._respond(404)
             return False
         port = self.server.server_port
@@ -190,7 +207,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(413)
             return
         try:
-            capture_id, batch_id, frames = _batch(self._read_body(length))
+            capture_id, batch_id, items = self.server.batch_parser(self._read_body(length))
         except TimeoutError:
             self._respond(408)
             return
@@ -200,7 +217,7 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, RecursionError):
             self._respond(400)
             return
-        self._respond(self.server.accept(capture_id, batch_id, frames))
+        self._respond(self.server.accept(capture_id, batch_id, items))
 
     def _body_length(self):
         lengths = self.headers.get_all("Content-Length", [])
@@ -270,14 +287,14 @@ def _pairing(path, url, token):
 
 
 @contextmanager
-def live_server(port, pairing_file, emit):
+def live_server(port, pairing_file, emit, *, public=False):
     """Bind, pair, announce, and yield the HTTP server without starting its loop."""
     if not _bounded_int(port, 65535):
         raise ValueError("监听端口必须是 0 到 65535 之间的整数")
     path = Path(pairing_file).expanduser().absolute()
     token = token_urlsafe(32)
-    with _Receiver(port, token, emit) as server:
-        url = f"http://{_HOST}:{server.server_port}{_ROUTE}"
+    with _Receiver(port, token, emit, public=public) as server:
+        url = f"http://{_HOST}:{server.server_port}{server.route}"
         with _pairing(path, url, token):
             emit({"type": "listening", "url": url, "pairing_file": str(path)})
             yield server

@@ -30,7 +30,8 @@ function display(next) {
   const tabNotice = phase === "idle" && selectedTabId === undefined ? " 请切换到 WPK 网页打开扩展。" : "";
   statusLine.textContent = next.message + tabNotice;
   stats.hidden = phase !== "capturing" && !next.sent && !next.dropped;
-  stats.textContent = `已确认 ${next.sent} 帧 · 未确认或丢弃 ${next.dropped} 帧`;
+  const unit = next.mode === "public" ? " 个快照" : " 帧";
+  stats.textContent = `已确认 ${next.sent}${unit} · 未确认或丢弃 ${next.dropped}${unit}`;
   refreshControls();
 }
 
@@ -62,9 +63,10 @@ fileInput.addEventListener("change", async () => {
     if (file.size < 1 || file.size > MAX_PAIRING_BYTES) throw new Error();
     const candidate = JSON.parse(await file.text());
     if (revision !== fileRevision) return;
-    if (!validatePairing(candidate)) throw new Error();
+    const endpoint = validatePairing(candidate);
+    if (!endpoint) throw new Error();
     pairing = candidate;
-    pairingLine.textContent = "配对文件已读取。";
+    pairingLine.textContent = endpoint.mode === "public" ? "配对成功，准备采集公开牌桌快照。" : "配对成功，准备采集帧元数据。";
   } catch {
     if (revision === fileRevision) pairingLine.textContent = "配对文件无效，请使用本机接收程序生成的 JSON 文件。";
   }

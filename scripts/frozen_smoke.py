@@ -1,6 +1,7 @@
 """Exercise the standalone executable with local OCR and H5 fixtures."""
 
 from base64 import b64encode
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
+from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 from uuid import uuid4
 
@@ -20,6 +22,46 @@ def run_command(executable, folder, env, *args):
         cwd=folder, env=env, check=True, timeout=180,
     )
     return json.loads(output.read_text(encoding="utf-8"))
+
+
+@contextmanager
+def h5_receiver(executable, folder, env, command, route, *args):
+    pairing_file = folder / f"{command}-pairing.json"
+    output = folder / f"{command}.jsonl"
+    with output.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen([executable, command, "--port", "0", "--pair-file", pairing_file, "--json",
+                                    *args], cwd=folder, env=env, stdout=log)
+        try:
+            deadline = monotonic() + 20
+            while process.poll() is None and monotonic() < deadline:
+                if pairing_file.is_file() and pairing_file.stat().st_size and output.read_bytes().endswith(b"\n"):
+                    break
+                sleep(0.05)
+            else:
+                raise ValueError(f"Standalone {command} did not create a ready pairing file.")
+            pairing = json.loads(pairing_file.read_text(encoding="utf-8"))
+            endpoint = urlsplit(pairing["url"])
+            if (pairing["version"] != 1 or not endpoint.port
+                    or pairing["url"] != f"http://127.0.0.1:{endpoint.port}{route}"):
+                raise ValueError(f"Standalone {command} paired to an unexpected endpoint.")
+            yield pairing, output
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def post_h5_batch(pairing, batch):
+    origin = f"chrome-extension://{'a' * 32}"
+    request = Request(pairing["url"], data=json.dumps(batch).encode("utf-8"), method="POST", headers={
+        "Authorization": f"Bearer {pairing['token']}", "Content-Type": "application/json", "Origin": origin,
+    })
+    with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
+        if response.status != 204 or response.headers.get("Access-Control-Allow-Origin") != origin:
+            raise ValueError("Standalone H5 receiver did not acknowledge the extension batch.")
 
 
 def assert_live_replay(executable, folder, screenshot, font, env):
@@ -185,7 +227,9 @@ def assert_profile_replay(executable, folder, fixtures, env):
 
 def assert_h5_capture(executable, folder, env):
     extension = executable.parent / "wpk-h5-capture"
-    if not all((extension / name).is_file() for name in ("manifest.json", "background.mjs", "popup.html")):
+    if not all((extension / name).is_file() for name in (
+        "manifest.json", "background.mjs", "protocol.mjs", "public-state.mjs", "popup.html",
+    )):
         raise ValueError("Missing Chrome capture extension in the standalone package.")
     if not (executable.parent / "docs" / "h5-action-collection.md").is_file():
         raise ValueError("Missing H5 action collection documentation in the standalone package.")
@@ -216,48 +260,77 @@ def assert_h5_capture(executable, folder, env):
     if any(field in profile_text for field in private_fields):
         raise ValueError("Standalone H5 packet profile exposed input bytes or identifiers.")
 
-    pairing_file = folder / "pairing.json"
     journal = folder / "network-frames.jsonl"
-    output = folder / "h5-live.jsonl"
-    with output.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen([executable, "h5-live", "--port", "0", "--pair-file", pairing_file,
-                                    "--journal", journal, "--json"], cwd=folder, env=env, stdout=log)
-        try:
-            deadline = monotonic() + 20
-            while process.poll() is None and monotonic() < deadline:
-                if pairing_file.is_file() and pairing_file.stat().st_size and output.read_bytes().endswith(b"\n"):
-                    break
-                sleep(0.05)
-            else:
-                raise ValueError("Standalone H5 receiver did not create a pairing file.")
-            pairing = json.loads(pairing_file.read_text(encoding="utf-8"))
-            frame = {**report["frames"][0], "encoding": "binary"}
-            batch = {"capture_id": str(uuid4()), "batch_id": str(uuid4()), "frames": [frame]}
-            request = Request(pairing["url"], data=json.dumps(batch).encode("utf-8"), headers={
-                "Authorization": f"Bearer {pairing['token']}", "Content-Type": "application/json",
-            })
-            with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
-                if response.status != 204:
-                    raise ValueError("Standalone H5 receiver did not acknowledge the batch.")
-            terminal = output.read_text(encoding="utf-8")
-            events = [json.loads(line) for line in terminal.splitlines()]
-            if (pairing["token"] in terminal or [event.get("frames") for event in events[1:]] != [[frame]]):
-                raise ValueError("Unexpected standalone H5 receiver output.")
-            journal_text = journal.read_text(encoding="utf-8")
-            start, recorded = map(json.loads, journal_text.splitlines())
-            arrival = recorded.pop("arrival_ms", None)
-            if (start != {"type": "calibration_start", "version": 1} or recorded != {"type": "h5_batch", **batch}
-                    or type(arrival) is not int or arrival < 0):
-                raise ValueError("Acknowledged H5 frame was missing or changed in the standalone network journal.")
-            if any(field in journal_text for field in (pairing["token"], "payloadData", "synthetic-connection")):
-                raise ValueError("Standalone network journal exposed a pairing credential or input field.")
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+    with h5_receiver(executable, folder, env, "h5-live", "/v1/frames", "--journal", journal) as (pairing, output):
+        frame = {**report["frames"][0], "encoding": "binary"}
+        batch = {"capture_id": str(uuid4()), "batch_id": str(uuid4()), "frames": [frame]}
+        post_h5_batch(pairing, batch)
+        terminal = output.read_text(encoding="utf-8")
+        events = [json.loads(line) for line in terminal.splitlines()]
+        if (pairing["token"] in terminal or [event.get("frames") for event in events[1:]] != [[frame]]):
+            raise ValueError("Unexpected standalone H5 receiver output.")
+        journal_text = journal.read_text(encoding="utf-8")
+        start, recorded = map(json.loads, journal_text.splitlines())
+        arrival = recorded.pop("arrival_ms", None)
+        if (start != {"type": "calibration_start", "version": 1} or recorded != {"type": "h5_batch", **batch}
+                or type(arrival) is not int or arrival < 0):
+            raise ValueError("Acknowledged H5 frame was missing or changed in the standalone network journal.")
+        if any(field in journal_text for field in (pairing["token"], "payloadData", "synthetic-connection")):
+            raise ValueError("Standalone network journal exposed a pairing credential or input field.")
+
+
+def assert_h5_public(executable, folder, env):
+    database = folder / "h5-public.sqlite3"
+    player_id = "00902173"
+    seat = {"slot": 4, "player_id": player_id, "action": None, "wager": 0, "stack": 100}
+    preflop = {"offset_ms": 0, "table_ref": "8821", "hand_ref": "7293601", "street": "preflop",
+               "board": [], "seats": [seat]}
+    flop = {**preflop, "offset_ms": 500, "street": "flop", "board": ["As", "Kc", "6d"],
+            "seats": [{**seat, "action": "bet", "wager": 12, "stack": 88}]}
+    turn = {**flop, "offset_ms": 1000, "hand_ref": None, "street": "turn", "board": [*flop["board"], "Th"],
+            "seats": [{**seat, "action": "raise", "wager": 20, "stack": 68}]}
+    batch = {"capture_id": str(uuid4()), "batch_id": str(uuid4()), "snapshots": [preflop, flop, turn]}
+    private_fields = {"player_id", "table_ref", "hand_ref"}
+
+    with h5_receiver(executable, folder, env, "h5-public", "/v1/public", "--db", database) as (pairing, output):
+        post_h5_batch(pairing, batch)
+        post_h5_batch(pairing, batch)
+        terminal = output.read_text(encoding="utf-8")
+        events = [json.loads(line) for line in terminal.splitlines()]
+        actions = [event for event in events if event["type"] == "public_action"]
+        if [(event["action"], event["wager"], event["hand_verified"]) for event in actions] != [
+            ("bet", 12, True), ("raise", 20, False),
+        ] or pairing["token"] in terminal or any(private_fields.intersection(event) for event in events):
+            raise ValueError("Standalone public H5 receiver did not emit exactly the expected redacted actions.")
+
+    observed = run_command(executable, folder, env, "h5-public-show", "--db", database)["events"]
+    board = [event["board"] for event in observed if event["type"] == "public_board" and event["board"]]
+    if (board != [turn["board"], flop["board"]]
+            or [event for event in observed if event["type"] == "public_action"] != list(reversed(actions))
+            or any(private_fields.intersection(event) for event in observed)):
+        raise ValueError("Standalone public H5 history did not persist the expected redacted observations.")
+    identified = run_command(
+        executable, folder, env, "h5-public-show", "--db", database, "--player", player_id, "--identities",
+    )["events"]
+    identified_actions = [(event["action"], event["hand_ref"], event["wager"])
+                          for event in identified if event["type"] == "public_action"]
+    if (identified_actions != [("raise", None, 20), ("bet", flop["hand_ref"], 12)]
+            or any(event.get("player_id") != player_id or event.get("table_ref") != flop["table_ref"]
+                   for event in identified)):
+        raise ValueError("Standalone public H5 history did not return the requested player's visible observations.")
+
+    player = json.loads(subprocess.check_output(
+        [executable, "players", "--db", database, "show", player_id, "--events", "10"],
+        cwd=folder, env=env, encoding="utf-8", timeout=30,
+    ))
+    history = [(event["hand_id"], event["seat"], event["street"], event["action"], event["wager"])
+               for event in player["events"]]
+    if (not player["registered"] or player["player_id"] != player_id or player["observed_hands"] != 1
+            or player["action_count"] != 1 or player["confirmed_preflop_hands"] != 0
+            or player["vpip"] is not None or player["pfr"] is not None
+            or player["observed_wager"]["count"] != 0
+            or history != [(flop["hand_ref"], "slot-4", "flop", "bet", None)]):
+        raise ValueError("Standalone public H5 actions did not reach player history with the expected attribution.")
 
 
 def assert_h5_correlation(executable, folder, env):
@@ -314,6 +387,7 @@ def main(executable):
             raise ValueError(f"Unexpected EV recommendation: {recommendation}")
 
         assert_h5_capture(executable, folder, env)
+        assert_h5_public(executable, folder, env)
         assert_h5_correlation(executable, folder, env)
         screenshot = folder / "牌桌.png"
         fixture_helpers["write_ocr_fixture"](screenshot)

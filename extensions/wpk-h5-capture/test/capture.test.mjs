@@ -1,15 +1,30 @@
 import assert from "node:assert/strict";
 import {test} from "node:test";
+import {setTimeout as wait} from "node:timers/promises";
 import {CaptureController, install} from "../background.mjs";
-import {frameMetadata, isWpkUrl, validatePairing} from "../protocol.mjs";
+import {frameMetadata, isWpkUrl, publicSnapshot, validatePairing} from "../protocol.mjs";
+import {PUBLIC_STATE_EXPRESSION} from "../public-state.mjs";
 
 const TAB_ID = 17;
 const source = {tabId: TAB_ID};
 const received = "Network.webSocketFrameReceived";
 const sent = "Network.webSocketFrameSent";
 const pairing = {version: 1, url: "http://127.0.0.1:8899/v1/frames", token: "X".repeat(43)};
+const publicPairing = {...pairing, url: "http://127.0.0.1:8899/v1/public"};
 const wpk = "https://h5.wpk.com/table?private=not-for-export";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const snapshot = {
+  table_ref: "0017", hand_ref: "95", street: "flop", board: ["As", "2c", "Qh"],
+  seats: [{slot: 2, player_id: "0081", action: "call", wager: 20, stack: 540.5}],
+};
+
+async function until(predicate) {
+  const deadline = performance.now() + 3000;
+  while (!predicate()) {
+    assert.ok(performance.now() < deadline, "timed out waiting for capture controller");
+    await wait(10);
+  }
+}
 
 function event(timestamp, opcode, payloadData, requestId = "private-protocol-request-id") {
   return {requestId, timestamp, response: {opcode, payloadData, mask: true}};
@@ -18,6 +33,7 @@ function event(timestamp, opcode, payloadData, requestId = "private-protocol-req
 function controller() {
   const calls = [];
   const requests = [];
+  const networkListeners = new Set();
   const api = {
     tabs: {get: async id => ({id, active: true, url: wpk})},
     debugger: {
@@ -25,13 +41,17 @@ function controller() {
       attach: async (...args) => { calls.push(["attach", ...args]); },
       sendCommand: async (...args) => { calls.push(["command", ...args]); },
       detach: async (...args) => { calls.push(["detach", ...args]); },
+      onEvent: {
+        addListener: listener => networkListeners.add(listener),
+        removeListener: listener => networkListeners.delete(listener),
+      },
     },
   };
   const capture = new CaptureController(api, async (url, options) => {
     requests.push({url, options});
     return new Response(null, {status: 204});
   });
-  return {capture, api, calls, requests};
+  return {capture, api, calls, requests, networkListeners};
 }
 
 function navigate(tabUrl, frameId = 0) {
@@ -44,11 +64,13 @@ test("accepts only the target HTTPS origin and canonical loopback pairing", () =
     "https://u@h5.wpk.com/", "https://h5.wpk.com:444/", "blob:https://h5.wpk.com/a", "about:blank"]) {
     assert.equal(isWpkUrl(url), false, url);
   }
-  assert.deepEqual(validatePairing(pairing), {url: pairing.url, token: pairing.token});
+  assert.deepEqual(validatePairing(pairing), {url: pairing.url, token: pairing.token, mode: "frames"});
+  assert.deepEqual(validatePairing(publicPairing), {url: publicPairing.url, token: pairing.token, mode: "public"});
   for (const url of ["https://127.0.0.1:8899/v1/frames", "http://localhost:8899/v1/frames",
     "http://127.1:8899/v1/frames", "http://127.0.0.1:8899/v1/frames?secret=1",
     "http://127.0.0.1:65536/v1/frames", "http://127.0.0.1:0/v1/frames", "http://127.0.0.1:8899/v1/frames\n",
-    "http://127.0.0.1:8899@third.party/v1/frames"]) {
+    "http://127.0.0.1:8899@third.party/v1/frames", "http://127.0.0.1:8899/v1/public/",
+    "http://127.0.0.1:8899/v1/public#some", "http://127.0.0.1:8899/v1/public\n"]) {
     assert.equal(validatePairing({...pairing, url}), null, url);
   }
   assert.equal(validatePairing({...pairing, token: "A".repeat(45) + "\n"}), null);
@@ -82,8 +104,10 @@ test("attachment is user-initiated, fail-closed for non-WPK or DevTools contenti
 });
 
 test("delivers the strict wire schema, ignores unrelated networks, and detaches on Stop", async () => {
-  const {capture, requests, calls} = controller();
+  const {capture, requests, calls, networkListeners} = controller();
   assert.equal((await capture.start(TAB_ID, pairing)).phase, "capturing");
+  assert.equal(capture.status().mode, "frames");
+  assert.equal(networkListeners.size, 1);
   const ignored = {
     get requestId() { assert.fail("unrelated event was read"); },
     get cookies() { assert.fail("cookie info was read"); },
@@ -98,6 +122,7 @@ test("delivers the strict wire schema, ignores unrelated networks, and detaches 
   const result = await capture.stop();
   assert.equal(result.sent, 3);
   assert.equal(result.dropped, 1);
+  assert.equal(networkListeners.size, 0);
   assert.deepEqual(calls, [["attach", source, "1.3"], ["command", source, "Network.enable", {}], ["detach", source]]);
   assert.equal(requests.length, 1);
   const request = requests[0];
@@ -119,6 +144,114 @@ test("delivers the strict wire schema, ignores unrelated networks, and detaches 
       {connection: "ws-2", offset_ms: 21, direction: "received", opcode: 9, size_bytes: 1, encoding: "control"},
     ],
   });
+});
+
+test("validates and copies only the public snapshot schema before queuing", () => {
+  const copied = publicSnapshot(snapshot, 18);
+  assert.deepEqual(copied, {offset_ms: 18, ...snapshot});
+  assert.notEqual(copied.board, snapshot.board);
+  assert.notEqual(copied.seats[0], snapshot.seats[0]);
+  for (const value of [
+    {...snapshot, rawPacket: "PRIVATE"}, {...snapshot, table_ref: "00"}, {...snapshot, hand_ref: "95\n"},
+    {...snapshot, board: ["As", "As"]}, {...snapshot, board: ["As\n"]},
+    {...snapshot, seats: [snapshot.seats[0], snapshot.seats[0]]},
+    {...snapshot, seats: [{...snapshot.seats[0], slot: 0}]},
+    {...snapshot, seats: [{...snapshot.seats[0], player_id: 81}]},
+    {...snapshot, seats: [{...snapshot.seats[0], stack: 1e13}]},
+    {...snapshot, seats: [{...snapshot.seats[0], wager: Infinity}]},
+    {...snapshot, seats: [{...snapshot.seats[0], name: "PRIVATE"}]},
+  ]) assert.equal(publicSnapshot(value, 18), null);
+  assert.equal(publicSnapshot(snapshot, -1), null);
+  assert.equal(publicSnapshot(snapshot, Number.MAX_SAFE_INTEGER + 1), null);
+});
+
+test("uses only fixed evaluation and loopback snapshot batches in public mode", async () => {
+  const {capture, api, requests, calls, networkListeners} = controller();
+  api.debugger.sendCommand = async (...args) => {
+    calls.push(["command", ...args]);
+    return {result: {value: snapshot}, ignored: {credential: "private-result-envelope"}};
+  };
+  capture.fetch = async (url, options) => {
+    requests.push({url, options});
+    return new Response(null, {status: requests.length === 1 ? 503 : 204});
+  };
+  assert.equal((await capture.start(TAB_ID, publicPairing)).mode, "public");
+  assert.equal(networkListeners.size, 0);
+  capture.onDebugEvent(source, received, {get requestId() { assert.fail("public mode read WebSocket traffic"); }});
+  await until(() => capture.run?.queue.length === 1);
+  const result = await capture.stop();
+  assert.equal(result.mode, "public");
+  assert.equal(result.phase, "idle");
+  assert.equal(result.sent, 1);
+  assert.equal(result.dropped, 0);
+  assert.deepEqual(calls, [
+    ["attach", source, "1.3"],
+    ["command", source, "Runtime.evaluate", {expression: PUBLIC_STATE_EXPRESSION, returnByValue: true, silent: true}],
+    ["detach", source],
+  ]);
+  assert.equal(typeof PUBLIC_STATE_EXPRESSION, "string");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].options.body, requests[1].options.body);
+  for (const {url, options} of requests) {
+    assert.equal(url, publicPairing.url);
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.Authorization, `Bearer ${publicPairing.token}`);
+    assert.doesNotMatch(options.body, /private-result-envelope/u);
+    const data = JSON.parse(options.body);
+    assert.match(data.capture_id, uuid);
+    assert.match(data.batch_id, uuid);
+    const {offset_ms} = data.snapshots[0];
+    assert.ok(Number.isSafeInteger(offset_ms) && offset_ms >= 0);
+    assert.deepEqual(data, {capture_id: data.capture_id, batch_id: data.batch_id, snapshots: [{offset_ms, ...snapshot}]});
+  }
+});
+
+test("waits for a visible table and discards late evaluations on navigation", async () => {
+  const {capture, api, requests, calls} = controller();
+  const evaluations = [];
+  api.debugger.sendCommand = (...args) => {
+    calls.push(["command", ...args]);
+    return new Promise(resolve => evaluations.push(resolve));
+  };
+  await capture.start(TAB_ID, publicPairing);
+  try {
+    await until(() => evaluations.length === 1);
+    await wait(550);
+    assert.equal(evaluations.length, 1);
+    capture.onNavigation(navigate(wpk), "before");
+    capture.onNavigation(navigate(wpk), "committed");
+    evaluations[0]({result: {value: snapshot}});
+    await until(() => evaluations.length === 2);
+    evaluations[1]({result: {value: null}});
+    await until(() => evaluations.length === 3);
+    assert.match(capture.status().message, /等待.*牌桌状态/u);
+    assert.equal(capture.status().sent, 0);
+    assert.equal(capture.status().dropped, 0);
+    assert.equal(requests.length, 0);
+    capture.onNavigation(navigate("https://other.example"), "before");
+    await capture.control;
+    evaluations[2]({result: {value: snapshot}});
+    await wait(10);
+    assert.equal(capture.status().phase, "idle");
+    assert.equal(requests.length, 0);
+    assert.deepEqual(calls.at(-1), ["detach", source]);
+  } finally {
+    await capture.stop();
+  }
+});
+
+test("keeps evaluation error details out of public status and loopback requests", async () => {
+  const {capture, api, requests} = controller();
+  api.debugger.sendCommand = async () => ({result: {value: snapshot}, exceptionDetails: {text: "private-credential"}});
+  await capture.start(TAB_ID, publicPairing);
+  try {
+    await until(() => capture.status().dropped === 1);
+    assert.match(capture.status().message, /正在重试/u);
+    assert.doesNotMatch(JSON.stringify(capture.status()), /private-credential/u);
+    assert.equal(requests.length, 0);
+  } finally {
+    await capture.stop();
+  }
 });
 
 test("continues same-origin navigation, stops on main-frame departure, and does not auto-attach", async () => {

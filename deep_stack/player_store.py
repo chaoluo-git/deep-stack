@@ -1,6 +1,7 @@
 """Local persistence for player identities and visible poker actions."""
 
 from contextlib import contextmanager
+import json
 from math import isfinite
 from pathlib import Path
 import re
@@ -69,6 +70,17 @@ CREATE TABLE IF NOT EXISTS club_profiles (
     recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS club_profiles_player ON club_profiles(player_id, profile_id);
+CREATE TABLE IF NOT EXISTS h5_public_observations (
+    event_id INTEGER PRIMARY KEY,
+    capture_id TEXT NOT NULL,
+    offset_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    player_id TEXT,
+    payload TEXT NOT NULL,
+    UNIQUE (capture_id, offset_ms, kind, slot)
+);
+CREATE INDEX IF NOT EXISTS h5_public_player ON h5_public_observations(player_id, event_id);
 """
 
 
@@ -311,6 +323,65 @@ class PlayerStore:
                     added += change == "added"
                     updated += change == "updated"
         return {"added": added, "updated": updated, "paused": sorted(paused)}
+
+    def record_h5_public(self, events):
+        """Store validated display observations and attribute only source-identified actions."""
+        if not events:
+            return
+        with self._write():
+            for event in events:
+                identity = (event["capture_id"], event["offset_ms"], event["type"], event.get("slot", 0))
+                payload = json.dumps(event, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
+                result = self._db.execute(
+                    """INSERT OR IGNORE INTO h5_public_observations
+                       (capture_id, offset_ms, kind, slot, player_id, payload) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (*identity, event.get("player_id"), payload),
+                )
+                if not result.rowcount:
+                    previous = self._db.execute(
+                        """SELECT payload FROM h5_public_observations
+                           WHERE capture_id = ? AND offset_ms = ? AND kind = ? AND slot = ?""", identity,
+                    ).fetchone()
+                    if previous is None or previous["payload"] != payload:
+                        raise ValueError("同一条 H5 观察记录出现冲突")
+                    continue
+                if event["type"] == "public_action" and event.get("player_id") and not event.get("wager_update"):
+                    self._record_h5_action(event)
+
+    def _record_h5_action(self, event):
+        table, hand, street = event.get("table_ref"), event.get("hand_ref"), event.get("street")
+        if not event["confirmed_hand"] or not table or not hand or street not in _STREETS:
+            return
+        player_id = _player_id(event["player_id"])
+        key = (f"wpk-h5:{table}", hand, f"slot-{event['slot']}", player_id)
+        self._db.execute("INSERT OR IGNORE INTO players (player_id) VALUES (?)", (player_id,))
+        self._db.execute(
+            """INSERT OR IGNORE INTO hand_seats (session_id, hand_id, seat, player_id)
+               SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+                   SELECT 1 FROM hand_seats WHERE session_id = ? AND hand_id = ? AND player_id = ?
+               )""",
+            (*key, key[0], hand, player_id),
+        )
+        binding = self._db.execute(
+            "SELECT player_id FROM hand_seats WHERE session_id = ? AND hand_id = ? AND seat = ?", key[:3],
+        ).fetchone()
+        if binding is not None and binding["player_id"] == player_id:
+            # The visible cumulative chips can update separately from the action label.
+            self._record_action(key, event["action"], street, None)
+
+    def h5_public_events(self, *, limit=100, player_id=None):
+        """Return recent H5 display observations, newest first."""
+        limit = _history_limit(limit)
+        if player_id is None:
+            rows = self._db.execute(
+                "SELECT payload FROM h5_public_observations ORDER BY event_id DESC LIMIT ?", (limit,),
+            )
+        else:
+            rows = self._db.execute(
+                "SELECT payload FROM h5_public_observations WHERE player_id = ? ORDER BY event_id DESC LIMIT ?",
+                (_player_id(player_id), limit),
+            )
+        return [json.loads(row["payload"]) for row in rows]
 
     def _record_action(self, key, kind, street, wager):
         rows = self._db.execute(

@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -92,6 +93,17 @@ def _parser():
     h5_live = commands.add_parser("h5-live", help="接收 Chrome 扩展的实时 WebSocket 消息摘要")
     _add_h5_listener(h5_live, 8767)
     h5_live.add_argument("--journal", type=Path, metavar="JOURNAL", help="新建网络帧元数据 JSONL 时间轴")
+
+    h5_public = commands.add_parser("h5-public", help="记录 H5 观战客户端的公开动作、牌面及玩家关联")
+    _add_h5_listener(h5_public, 0)
+    h5_public.add_argument("--db", type=Path, default=Path("players.sqlite3"), help="保存到本机 SQLite 数据库")
+
+    public_show = commands.add_parser("h5-public-show", help="查看已记录的 H5 公开观察")
+    public_show.add_argument("--db", type=Path, default=Path("players.sqlite3"), help="读取本机 SQLite 数据库")
+    public_show.add_argument("--limit", type=int, default=100, help="最多显示最近多少条记录，1 至 1000")
+    public_show.add_argument("--player", metavar="PLAYER_ID", help="只查询指定玩家的公开观察")
+    public_show.add_argument("--identities", action="store_true", help="在本地查询中包括桌号、手牌号和玩家 ID")
+    _add_output(public_show)
 
     calibration = commands.add_parser("h5-calibrate", help="在同一时间轴上采集 H5 帧和可见牌局动作")
     calibration.add_argument("timeline", type=Path, metavar="TIMELINE", help="创建新的匿名校准 JSONL 文件")
@@ -311,6 +323,71 @@ def _run_h5_live(args):
             raise journal_failure
 
 
+def _redact_h5_public(event):
+    safe = {key: value for key, value in event.items() if key not in {"player_id", "table_ref", "hand_ref"}}
+    if "player_id" in event:
+        safe["player_verified"] = event["player_id"] is not None
+    safe["hand_verified"] = bool(event.get("table_ref") and event.get("hand_ref"))
+    return safe
+
+
+def _print_h5_public(event, json_lines):
+    from .live_actions import _ACTION_LABELS, _STREET_LABELS
+
+    if json_lines:
+        print(json.dumps(_redact_h5_public(event), ensure_ascii=False, allow_nan=False), flush=True)
+    elif event["type"] == "public_board" and event["board"]:
+        print(f"H5 公共牌  {' '.join(event['board'])}", flush=True)
+    elif event["type"] == "public_action":
+        label = _ACTION_LABELS[event["action"]]
+        amount = "" if event.get("wager") is None else f" 可见本街投入 {event['wager']:g}"
+        street = _STREET_LABELS.get(event.get("street"), "街次待核对")
+        confirmed = bool(event.get("player_id") and event.get("table_ref") and event.get("hand_ref"))
+        status = "源数据已关联" if confirmed else "玩家或手牌待核对"
+        if event["wager_update"]:
+            status += "，投入读数更新"
+        print(f"H5 {street} 槽位 {event['slot']} {label}{amount}｜{status}", flush=True)
+
+
+def _run_h5_public(args):
+    from .h5_live import live_server
+    from .h5_public import PublicCapture
+    from .player_store import PlayerStore
+
+    database = args.db.expanduser().resolve()
+    capture = PublicCapture()
+    failure = None
+
+    def receive(event):
+        nonlocal failure
+        if event["type"] == "listening":
+            if args.json:
+                print(json.dumps({**event, "database": str(database)}, ensure_ascii=False), flush=True)
+            else:
+                print(f"H5 公开状态监听 {event['url']}\n配对文件 {event['pairing_file']}\n数据库 {database}", flush=True)
+            return
+        observations = capture.accept(event["capture_id"], event["snapshots"])
+        try:
+            store.record_h5_public(observations)
+            for observation in observations:
+                _print_h5_public(observation, args.json)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            failure = error
+            raise
+
+    with _h5_pairing_file(args.pair_file) as pairing:
+        if database == pairing.resolve():
+            raise ValueError("H5 观察数据库与配对文件需要不同路径")
+        try:
+            os.close(os.open(database, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        except FileExistsError:
+            pass
+        with PlayerStore(database) as store, live_server(args.port, pairing, receive, public=True) as server:
+            while failure is None:
+                server.handle_request()
+            raise failure
+
+
 def _run_h5_calibrate(args):
     from threading import Thread
     from time import monotonic
@@ -379,6 +456,19 @@ def _run_h5_calibrate(args):
 def _run(args):
     if args.command == "h5-live":
         return _run_h5_live(args)
+    if args.command == "h5-public":
+        return _run_h5_public(args)
+    if args.command == "h5-public-show":
+        from .player_store import PlayerStore
+
+        database = args.db.expanduser()
+        if not database.is_file():
+            raise ValueError("找不到 H5 观察数据库")
+        if args.output is not None and args.output.expanduser().resolve() == database.resolve():
+            raise ValueError("H5 查询结果与观察数据库需要不同路径")
+        with PlayerStore(database) as store:
+            events = store.h5_public_events(limit=args.limit, player_id=args.player)
+        return {"events": events if args.identities else [_redact_h5_public(event) for event in events]}
     if args.command == "h5-profile":
         from .h5_packet_profile import profile_packets
 
@@ -478,7 +568,7 @@ def main(argv=None):
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     except (KeyboardInterrupt, subprocess.TimeoutExpired):
-        if args.command in {"live", "h5-live", "h5-calibrate"}:
+        if args.command in {"live", "h5-live", "h5-calibrate", "h5-public"}:
             return 0
         print("操作已中断或超时。", file=sys.stderr)
         return 130

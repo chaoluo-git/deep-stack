@@ -1,6 +1,6 @@
 # WPK H5 牌局动作采集生产规范
 
-目标是从 WPK H5 网络消息持续记录当前牌桌上已经公开的动作，回答哪一桌、哪一手、哪个位置的玩家在何时做了什么，以及能确认的筹码变化。实时动作须来自已验证的包内业务字段。画面用于人工复核和标注样本。记录应可回查来源，可发现漏采，并能在桌况和金额足够明确时交给 EV 分析。首批验收覆盖 8 座和 9 座标准无限注德州扑克的观战与入座场景。
+目标是记录 WPK H5 牌桌已公开的动作、公牌和筹码，回答哪一桌、哪一手、哪个位置的玩家做了什么。当前 `h5-public` 从官网观战客户端采样，供观察与赛后核对。网络路线独立记录帧元数据，正式网络动作事件以验证过的包内字段为准。画面与官方牌局回顾可作独立对照。网络路线的首批验收覆盖 8 座和 9 座标准无限注德州扑克的观战与入座场景，并检查数据能否用于后续 EV 分析。
 
 ## 当前证据和数据来源
 
@@ -8,11 +8,64 @@
 
 | 来源 | 当前用途 |
 | --- | --- |
+| 当前 Chrome WPK 观战页的客户端公开状态 | 采样可见公牌、动作及筹码变化。以已核对的桌、手、街次和玩家绑定保存归属。 |
 | 当前 Chrome WPK 标签页的 WebSocket 摘要 | 记录匿名连接号、相对时间、方向、操作码、字节数、编码特征及本机批次到达时间。用于连接健康、周期识别和时序校准。 |
 | 同桌画面人工标注 | 为已公开可见的座位、动作、街次、金额和公共牌提供独立对照。画面遮挡或证据冲突时保留缺项。 |
 | 厂商授权接口、文档化的公开事件或官方牌谱 | 获得相应文档和样本后验证字段。牌谱可作结算核对或离线金标，实时来源须单独验证。 |
 
 写入动作库前须有明确的数据来源和验证记录。负载、令牌、Cookie、带查询参数的地址、对手未公开的底牌以及从消息长度推断的玩家和动作均排除在采集结果之外。原始 HAR 仅供本机受控检查，清理版导出也可能包含完整消息数据。 [Chromium HAR 导出实现](https://github.com/ChromeDevTools/devtools-frontend/blob/main/front_end/models/har/Log.ts)
+
+## 公开客户端代码证据
+
+本次核对的公开 Cocos 浏览器主包版本为 `b7cb5`。Chrome HAR 中四条 WSS 连接的发起栈顶均为 `connectUrl`，在公开主包单行脚本的列号 11,682,298 处与 `HMFClient` 的浏览器 WebSocket 构造位置一致。这为当前样本的传输处理器提供了静态和抓包两份证据。 [WPK H5 入口](https://h5.wpk.com/) · [公开客户端主包](https://h5.wpk.com/assets/main/index.b7cb5.bin)
+
+页面同时包含 MessagePack 和 Protobuf 运行时。启动器中的 MessagePack 资源解包示例处于注释中。3,327 条捕获消息从字节 0 尝试读取完整 MessagePack 对象时均无单对象匹配。完整多对象偶合量为 30 条，同长度随机对照为 26 条。`HMFClient` 的接收代码使用二进制缓冲区，并包含按分支进行 gzip 解包、应用层解密、业务 Protobuf 解析和派发的处理。`DataEncoder` 的部分保护分支使用 AES-GCM。具体某帧选用的处理分支与业务字段仍待验证。 [公开启动器](https://h5.wpk.com/main.a85d7.js) · [公开 Protobuf 库](https://h5.wpk.com/src/assets/scripts/base/protobuf.0554b.js) · [MessagePack 规范](https://github.com/msgpack/msgpack/blob/master/spec.md)
+
+网关分支所用的 `proxy.BaseFrame` 在公开资源中有完整定义。字段为 `type`（#1，int32）、`data`（#2，bytes）、`target`（#3，string）和 `gzip`（#4，bool）。用该定义检查全部 3,327 条旧抓包，要求存在类型字段、字段号和线类型吻合且完整消耗帧字节。从偏移 0 到 8 的每个位置，完整匹配均为 0。当前证据能验证客户端分支和结构，但尚不足以判定哪一种处理分支用于某条抓包。 [公开 BaseFrame 定义](https://h5.wpk.com/assets/resources/import/99/995cd24e-2ac7-446b-b05f-b411f290c632.a7c5f.json)
+
+| 客户端静态定义 | 可验证的字段名示例 |
+| --- | --- |
+| `NoticePlayerAction` | `last_action_seat_id`、`action_type`、`amount`、`ActionSeq`、`pots`。`GameNetWork` 注册 `MsgID_PlayerAction_Notice` 处理器，解码后交给牌桌更新流程。 |
+| `NoticePlayerActionTurn` | `curr_action_seat_id`、`action_time`、`call_amount`、`minimum_bet`、`last_valid_raise_amount`。 |
+| `NoticeGameBlind` 与 `NoticeGameAnte` | 庄位、大小盲座位和金额、逐座前注信息。 |
+| `PlayerInfo` 与 `NoticeCommunityCards` | `playerid`、`seatid`、`stake`、`round_bet`，以及公共牌、下注轮次和 `gameUuid`。 |
+
+这些名称和字段属于公开客户端的业务层定义。原始会话里的具体动作、金额单位和事件顺序仍需通过已获准使用的解码来源或同手牌牌谱核验。客户端还打包有 `GameActionRecordDataCtrl`、`ClubHandRecordsNew` 和 `HoldemReplayScene`。当前 Chrome H5 观战牌局回顾入口已实测，结构化导出能力仍待核实。 [公开客户端主包](https://h5.wpk.com/assets/main/index.b7cb5.bin)
+
+## 观战回顾实测
+
+在 H5 观战桌实测，右上角叠牌图标打开官方牌局回顾。面板可翻阅不同手，分街显示已公开的动作、金额和公共牌，并标记庄位及大小盲。同一场次翻手时，面板标题的「牌局ID」保持不变。验收标签使用手序号区分，服务端唯一手牌标识须从独立来源核对。客户端有本地缓存与内部缺页补取逻辑，观察到的回顾没有提供结构化导出入口。 [WPK H5](https://h5.wpk.com/) · [公开客户端主包](https://h5.wpk.com/assets/main/index.b7cb5.bin)
+
+新桌再次取得原始 WebSocket 样本。2026 年 11 月 27 日 14:48:11 至 14:53:53 的最终导出记录 496 帧，其中下行 424、上行 72，全部为二进制。第 14 手从看到翻前开始到看到结算之间记录了 76 帧，其中下行 64、上行 12。人工先在实时牌桌确认翻牌 J♦、6♠、2♣，再确认转牌 7♦ 和河牌 2♥。官方回顾确认完整牌面，并显示 BTN 和 BB 各自的翻前跟注 22、翻牌过牌、转牌跟注 54、河牌过牌。公开 `proxy.BaseFrame` 从偏移 0 至 8 在全部帧和同手观察区间内均无完整匹配。报文长度和到达时间只能定位候选帧，实际动作的线级顺序和金额语义尚待授权机器数据核对。
+
+公开客户端的业务派发还确认了 `actionNotify → BattleActionMsg` 和 `roundChangeNotify → BattleRoundChangeMsg`。前者的 `actionList` 提供座位、动作、金额候选及 `actionId`、`round`。后者的 `dealPublicCards` 是每轮新增的公共牌，客户端随后归入当前牌面。采集应按手牌建状态并累积公共牌。 [公开响应消息定义](https://h5.wpk.com/assets/resources/import/2f/2f6eb76a-cca7-498d-bab6-1260d71d9aa9.7c053.json)
+
+## 客户端公开显示字段实测
+
+使用 Chrome DevTools 在已打开的 H5 观战页做只读验证。实时读取活跃 Cocos 场景的座位动作文本、界面本街投入和已显示的公共牌 Sprite 牌值。官方回顾则读取当前已打开手牌的公开公牌槽和按街排列的渲染动作标签。
+
+- 第 14 手的官方回顾结构化返回 J♦、6♠、2♣、7♦、2♥，庄位和大盲位均为翻前跟注 22、翻牌让牌、转牌跟注 54、河牌让牌，与此前独立的画面核验相符。
+- 第 59 手连续观测约 30 秒，保留 13 个变化状态。客户端读到完整公共牌 K♣、3♥、J♦、10♠、K♥，并先后显示槽位 4 转牌下注 54、槽位 2 转牌跟注 54。已用同手官方回顾对照牌值、街次和两项金额。局部采样快照可能出现转牌已更新而第 4 张牌仍在绘制的情况。入库前按街次核验可见牌槽数量。
+
+现场校验还确认，两个客户端模型的场次 ID 均与官方回顾标题的「牌局ID」一致，当前手号随换手递增，八位活跃玩家的座位模型与头像模型 ID 分别一致。另在 9 座桌核对了一位玩家，公开头像资料弹窗的 ID 与该座位一致，当时客户端观战座位状态为 `0`。完整动作时序、遗漏统计、跨客户端版本兼容和原始 WebSocket 到业务事件映射仍待验证。 [Chrome DevTools 调试参考](https://developer.chrome.com/docs/devtools/javascript/reference)
+
+## 使用 H5 观战采集
+
+启动观战接收器，再保持已打开标准德州观战桌的 Chrome 标签页可见。关闭同一标签页的 DevTools，在「WPK 采集」选择终端显示的配对文件并点击「开始」。扩展约每 500 毫秒读取一次已展示的状态，切到后台或退出牌桌期间等待。结束时先点击扩展的「停止」，再关闭接收器。 [扩展安装与配对](../README.md#h5-观战采集)
+
+```bash
+deep-stack h5-public --db players.sqlite3
+deep-stack h5-public-show --db players.sqlite3 --limit 30
+deep-stack h5-public-show --db players.sqlite3 --limit 30 --identities
+deep-stack h5-public-show --db players.sqlite3 --player 001234 --limit 30
+deep-stack players --db players.sqlite3 show 001234 --events 20
+```
+
+`h5-public --json` 输出 JSON 行。`h5-public-show` 读取最近的观察记录，默认隐去桌号、手号和玩家 ID。加 `--identities` 可在本机核对这些字段。`--player` 筛选该玩家对应的观察，`players show` 查询该玩家的汇总。两条命令均使用公开的数字玩家 ID，替换示例的 `001234` 即可。数据库保存在指定的本机路径。
+
+当前观察事件包括 `public_table`、`public_board`、`public_identity`、`public_chips` 和 `public_action`。牌桌 ID 由两个客户端模型核对，手号取官方回顾引用的当前手号。玩家 ID 以同帧座位与头像资料来源一致且唯一为准，冲突或不完整时留空。只有具备已确认桌号、手号、街次和玩家的观察动作才进入玩家动作统计。`wager` 是当街可见累计投入，`stack` 是可见剩余筹码读数。数字标签按界面读数记录，带单位时要求客户端的金额格式化结果与显示一致。
+
+界面标签可能停留并晚于实际动作。采集会合并可识别的重复标签，标签相同而累计投入增加时可保留读数更新 `wager_update`。累计投入可在 `h5-public-show` 中查询。`players show` 中的动作统计不会把动画期间的累计投入算作单次动作金额。两次采样之间可以漏过动作，同帧也无法确认各座位的先后顺序。缺少整手观测时应以官方回顾核对。打开牌桌右上角叠牌图标后可逐手比对公牌、各街动作和金额。该接收器用于观战与赛后回查，实时 EV 建议有独立的决策条件和入口。`h5-live` 与 `h5-profile` 用于网络帧和封包分析。
 
 ## 实时包采集、封包分析和核对
 
@@ -39,7 +92,7 @@ Hand2Note 3 的官方亚洲页面也曾列出 WePoker、PokerMaster、PokerKing�
 
 ## 正式动作事件合同
 
-以下是后续生产记录的合同。当前校准文件采用独立的精简字段。动作由已验证的网络字段产生，画面和赛后牌谱可为对应字段提供独立验证。
+以下是后续生产网络动作记录的合同。当前校准文件和 `h5-public` 观察各自采用独立的精简字段。正式网络动作由已验证的包内字段产生，画面和赛后牌谱可为对应字段提供独立验证。
 
 | 字段组 | 约定 |
 | --- | --- |
@@ -70,4 +123,4 @@ Hand2Note 3 的官方亚洲页面也曾列出 WePoker、PokerMaster、PokerKing�
 | 跟注、让牌、弃牌、下注、加注、全下，盲注、ante 与退款 | 动作归属、金额口径、底池对账，覆盖同街再次行动和快速连续动作。 |
 | 断线、重连、重复批次、乱序和缺帧 | 幂等、单一顺序、缺口可追踪，有明确验证条件时恢复输出。 |
 | 截图遮挡、客户端切桌、动作倒计时变化和高延迟 | 确认当前行动者，过期撤下建议，保留可回查的等待原因。 |
-| 高速批次、超限、错误数据和敏感信息 | 接收仅绑定本机，按现有批次限制验证，队列有上限，报告通过字段白名单断言。合成秘密、原始内容和原始身份都不得出现在日志、错误或报告。 |
+| 高速批次、超限、错误数据和敏感信息 | 接收仅绑定本机，按现有批次限制验证，队列有上限，报告通过字段白名单断言。秘密和原始消息不进入日志、错误及派生报告，公开数字身份在本机存储，默认输出中隐藏。 |

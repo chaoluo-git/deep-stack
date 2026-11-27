@@ -1,14 +1,37 @@
 # Deep Stack 德州扑克牌桌识别与 EV 分析
 
-在本地从牌桌截图提取可见信息，按座位整理动作和筹码。确认牌局状态后，比较合法候选动作从当前决策点出发的筹码期望值（EV）。结果取决于输入的对手范围、响应概率、下注金额和结算规则。
+在本地记录 WPK H5 观战牌桌的公开动作、公牌和筹码，也可从截图提取可见信息。用已核对的牌局状态复盘时，可以比较候选动作从当前决策点出发的筹码期望值（EV）。结果取决于输入的对手范围、响应概率、下注金额和结算规则。
 
 ## 适用范围
 
 - 首版使用标准 52 张牌的无限注德州扑克和普通筹码 EV。短牌、特种玩法、锦标赛奖金与 ICM 需要单独的规则及模型。
-- WPK H5 的实地观察样本是横向九座牌桌，左右各三座、顶部两座、底部中央为自己。昵称会被操作提示盖住，弃牌提示可压在头像上，手牌弃牌后会变暗。公共牌在中间，当前投入与剩余筹码靠近座位。浏览器的无障碍树没有提供这些文字字段，识别从截图读取。
+- WPK H5 的实地观察样本是横向九座牌桌，左右各三座、顶部两座、底部中央为自己。昵称会被操作提示盖住，弃牌提示可压在头像上，手牌弃牌后会变暗。公共牌在中间，当前投入与剩余筹码靠近座位。浏览器的无障碍树没有提供这些文字字段，屏幕识别入口从截图读取。
 - 画面中心有上下两行金额。观察到的单帧中，两行金额的差值恰好等于一个座位的一笔投入。底池合计时应以牌谱或人工核对为准。观察到的 `2/4(2)`、带入上限和保险等字段未用于推断本桌具体计价规则。
 - 座位编号用于关联同一手牌的画面。余额是显示的剩余筹码，本轮投入和整手累计投入单独记录。动作日志只能记录采样到的变化。重复出现的同标签以及两帧之间的动作，需要用完整牌谱补齐。截图缩放、遮挡、动画和主题会影响识别，自动回归使用固定合成截图序列。
-- `wpk.com` 官网公开说明会打击伙牌和作弊。截至 2026 年 11 月 26 日，在官网及其新闻、下载、品牌等公开入口中尚未核实到对第三方实时辅助的官方条款。识别验证使用本地合成数据。[WPK 官网](https://www.wpk.com/) · [WPK H5](https://h5.wpk.com/)
+- `wpk.com` 官网公开说明会打击伙牌和作弊。截至 2026 年 11 月 26 日，在官网及其新闻、下载、品牌等公开入口中尚未核实到对第三方实时辅助的官方条款。截图识别的自动回归验证使用本地合成数据。[WPK 官网](https://www.wpk.com/) · [WPK H5](https://h5.wpk.com/)
+
+## H5 观战采集
+
+打开 Chrome 里的 WPK H5 德州观战牌桌，保持目标标签页可见。该模式直接读取官网客户端已显示的牌桌状态，将变化保存到本机 SQLite。
+
+```bash
+deep-stack h5-public --db players.sqlite3
+```
+
+1. 在 Chrome 118 或以上打开 `chrome://extensions`，启用「开发者模式」后加载未打包的扩展。源码目录为 `extensions/wpk-h5-capture`，独立包内为 `wpk-h5-capture`。已有扩展时重新加载即可。
+2. 关闭目标标签页的 DevTools。在 WPK 标签页打开「WPK 采集」扩展，选择终端显示的本机配对文件。看到「准备采集公开牌桌快照」后点击「开始」。文件选择器关闭弹窗时，可选「在独立窗口配对」。
+3. 终端会显示已观察到的动作、公牌和身份确认状态。结束时点击扩展的「停止」，再按 `Ctrl+C` 关闭本机接收程序。重启接收程序后使用新配对文件。
+
+```bash
+deep-stack h5-public-show --db players.sqlite3 --limit 30
+deep-stack h5-public-show --db players.sqlite3 --limit 30 --identities
+deep-stack h5-public-show --db players.sqlite3 --player 001234 --limit 30
+deep-stack players --db players.sqlite3 show 001234 --events 20
+```
+
+本机数据库可按官网头像资料页的公开数字 ID 关联玩家。只有牌桌、手号、街次与玩家均已确认的动作才归入该玩家的统计。采集终端和 `h5-public-show` 默认隐藏桌号、手号与玩家 ID。`--identities` 在本机查询中显示它们。用 `--player` 筛选某位玩家的观察记录，或用 `players show` 查询其汇总。将示例 `001234` 换成已核对的玩家 ID。
+
+动作标签会停留，本街投入是当街累计读数。两次采样之间的动作、同一时刻多个座位的先后顺序及缺失的整手记录需用官方牌局回顾核对。该模式用于观战记录和赛后核对，现场建议仅在独立的 `live` 截图入口及其决策条件下提供。观战采集与下面的网络帧统计各有独立配对文件和输出。 [动作采集规范](docs/h5-action-collection.md)
 
 ## H5 网络观察
 
@@ -22,7 +45,7 @@ python3 -m deep_stack h5-inspect "$HOME/Downloads/h5-wpk.har" -o "$HOME/Download
 
 `h5-inspect` 读取已有文件。缺少输入文件时，它会报告查找的路径。
 
-报告含匿名连接编号、相对时间、方向、操作码、字节长度和编码特征计数。Chrome 的清理版 HAR 仍可能带有原始消息与请求地址，适合在本机处理和分享派生的 `h5-summary.json`。样本较大时，可缩短采样窗口或筛选当前连接后导出。当前样本确认能持续采到二进制消息，座位、筹码、公共牌和动作字段尚待用可见牌局逐项对照。实时牌局识别目前仍由屏幕入口提供。[Chromium HAR 导出实现](https://github.com/ChromeDevTools/devtools-frontend/blob/main/front_end/models/har/Log.ts#L139-L176)
+报告含匿名连接编号、相对时间、方向、操作码、字节长度和编码特征计数。Chrome 的清理版 HAR 仍可能带有原始消息与请求地址，适合在本机处理和分享派生的 `h5-summary.json`。样本较大时，可缩短采样窗口或筛选当前连接后导出。当前样本确认能持续采到二进制消息，从原始帧到座位、筹码、公牌和动作的字段映射仍待验证。[Chromium HAR 导出实现](https://github.com/ChromeDevTools/devtools-frontend/blob/main/front_end/models/har/Log.ts#L139-L176)
 
 ### 实时采集
 
@@ -33,7 +56,7 @@ deep-stack h5-live
 deep-stack h5-live --port 0 --journal network-session.jsonl --json
 ```
 
-Chrome 118 或以上可在 `chrome://extensions` 加载未打包的扩展，源码目录为 `extensions/wpk-h5-capture`，独立包内为 `wpk-h5-capture`。关闭同一 WPK 标签页已打开的 DevTools，在 `https://h5.wpk.com` 标签页打开扩展，选择终端显示的配对文件，点击「开始采集」。系统文件选择器如果关掉了小弹窗，可以用「在独立窗口配对」。采集时 Chrome 会显示调试提示。扩展的「停止采集」、关闭目标标签页或离开 WPK 会结束采集。接收程序重启后使用新生成的配对文件。[Chrome Debugger API](https://developer.chrome.com/docs/extensions/reference/api/debugger)
+使用上文所述的 Chrome 扩展，在 `https://h5.wpk.com` 标签页选择 `h5-live` 终端显示的配对文件。看到「准备采集帧元数据」后点击「开始」。采集时 Chrome 会显示调试提示。点击「停止」、关闭目标标签页或离开 WPK 会结束采集。接收程序重启后使用新配对文件。[Chrome Debugger API](https://developer.chrome.com/docs/extensions/reference/api/debugger)
 
 接收程序只监听 `127.0.0.1`。扩展在本地生成帧的时间、方向、操作码、字节数与编码标签，HTTP 批次只带这些元数据和匿名标识。配对令牌由本地文件提供，监听停止后配对失效。终端会把满足周期和延迟条件的往返标为「可能是保活或轮询」。可用 `h5-inspect --patterns` 对已导出的文件做同样的检测。牌局事件仍需要可验证的字段映射后才能进入 EV 分析。[CDP WebSocket 帧定义](https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-WebSocketFrame)
 

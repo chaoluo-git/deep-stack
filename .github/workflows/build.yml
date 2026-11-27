@@ -43,7 +43,9 @@ jobs:
       - name: Run tests
         run: python -m scripts.run_tests
       - name: Test the Chrome capture extension
-        run: node --test extensions/wpk-h5-capture/test/capture.test.mjs
+        run: >-
+          node --test extensions/wpk-h5-capture/test/capture.test.mjs
+          extensions/wpk-h5-capture/test/public-state.test.mjs
       - name: Bundle the application
         run: >-
           python -m PyInstaller --noconfirm --clean --onedir --name deep-stack
