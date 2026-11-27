@@ -1,10 +1,11 @@
 from contextlib import contextmanager, redirect_stderr
 from copy import deepcopy
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPResponse
 from io import StringIO
 import json
 import os
 from pathlib import Path
+from socket import create_connection
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
@@ -148,6 +149,26 @@ class H5LiveTests(unittest.TestCase):
                     self.assertNotIn(token_like, str(response_headers))
             self.assertEqual(len(self.events), 1)
         self.assertEqual(logs.getvalue(), "")
+
+    def test_early_rejection_is_sent_before_a_delayed_body_is_discarded(self):
+        with patch("deep_stack.h5_live._REJECT_DRAIN_TIMEOUT", 2), self.receiver():
+            body = b"rejected body must stay private"
+            host = f"127.0.0.1:{self.server.server_port}"
+            headers = (f"POST /rejected HTTP/1.1\r\nHost: {host}\r\n"
+                       f"Content-Length: {len(body)}\r\n\r\n").encode("ascii")
+            with create_connection(self.server.server_address, timeout=3) as connection:
+                connection.sendall(headers)
+                with HTTPResponse(connection) as response:
+                    response.begin()
+                    self.assertEqual((response.status, response.read()), (404, b""))
+                connection.settimeout(0.05)
+                with self.assertRaises(TimeoutError):
+                    connection.recv(1)
+                connection.settimeout(3)
+                connection.sendall(body)
+                self.assertEqual(connection.recv(1), b"")
+            self.assertEqual(len(self.events), 1)
+            self.assertEqual(self.request(payload(_FRAME))[0], 204)
 
     def test_invalid_metadata_and_size_limits(self):
         good = payload(_FRAME)

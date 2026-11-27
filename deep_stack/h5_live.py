@@ -20,6 +20,7 @@ _MAX_BATCH_BYTES = 64 * 1024
 _MAX_FRAMES = 128
 _MAX_REMEMBERED_BATCHES = 4096
 _IO_TIMEOUT = 3
+_REJECT_DRAIN_TIMEOUT = 0.125
 _MAX_SAFE_INTEGER = 2**53 - 1
 _EXTENSION_ORIGIN = re.compile(r"chrome-extension://[a-p]{32}")
 _CONNECTION = re.compile(r"ws-[1-9][0-9]{0,8}")
@@ -134,7 +135,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             self.end_headers()
         except OSError:
-            pass  # The peer may have closed before reading the response.
+            return  # The peer may have closed before reading the response.
+        if status in {401, 403, 404, 415} and self.command == "POST":
+            self._discard_rejected_body()
 
     def _check_endpoint(self):
         if self.path != _ROUTE:
@@ -179,11 +182,10 @@ class _Handler(BaseHTTPRequestHandler):
         if len(types) != 1 or types[0].split(";", 1)[0].strip().lower() != "application/json":
             self._respond(415)
             return
-        lengths = self.headers.get_all("Content-Length", [])
-        if self.headers.get_all("Transfer-Encoding") or len(lengths) != 1 or not _CONTENT_LENGTH.fullmatch(lengths[0]):
+        length = self._body_length()
+        if length is None:
             self._respond(400)
             return
-        length = int(lengths[0])
         if length > _MAX_BATCH_BYTES:
             self._respond(413)
             return
@@ -200,19 +202,39 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._respond(self.server.accept(capture_id, batch_id, frames))
 
+    def _body_length(self):
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get_all("Transfer-Encoding") or len(lengths) != 1 or not _CONTENT_LENGTH.fullmatch(lengths[0]):
+            return None
+        return int(lengths[0])
+
+    def _discard_rejected_body(self):
+        length = self._body_length()
+        if length is None or not 0 < length <= _MAX_BATCH_BYTES:
+            return
+        # Closing with unread request bytes can reset the connection before the
+        # client reads its rejection. Drain known small bodies after responding.
+        try:
+            for _ in self._body_chunks(length, _REJECT_DRAIN_TIMEOUT):
+                pass
+        except (OSError, ValueError):
+            pass
+
     def _read_body(self, length):
-        deadline = monotonic() + _IO_TIMEOUT
-        body = bytearray()
-        while len(body) < length:
+        return b"".join(self._body_chunks(length, _IO_TIMEOUT))
+
+    def _body_chunks(self, length, timeout):
+        deadline = monotonic() + timeout
+        while length:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise TimeoutError
             self.connection.settimeout(remaining)
-            chunk = self.rfile.read1(length - len(body))
+            chunk = self.rfile.read1(length)
             if not chunk:
                 raise ValueError("incomplete body")
-            body.extend(chunk)
-        return body
+            length -= len(chunk)
+            yield chunk
 
 
 def _same_file(path, created):
