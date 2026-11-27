@@ -1,5 +1,6 @@
-"""Exercise the standalone executable with the source suite's OCR fixture."""
+"""Exercise the standalone executable with local OCR and H5 fixtures."""
 
+from base64 import b64encode
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,9 @@ import runpy
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep
+from urllib.request import ProxyHandler, Request, build_opener
+from uuid import uuid4
 
 
 def run_command(executable, folder, env, *args):
@@ -179,6 +183,60 @@ def assert_profile_replay(executable, folder, fixtures, env):
         raise ValueError(f"Unexpected saved player profile: {player}")
 
 
+def assert_h5_capture(executable, folder, env):
+    extension = executable.parent / "wpk-h5-capture"
+    if not all((extension / name).is_file() for name in ("manifest.json", "background.mjs", "popup.html")):
+        raise ValueError("Missing Chrome capture extension in the standalone package.")
+
+    trace = folder / "synthetic-h5.json"
+    frames = []
+    for index in range(6):
+        for method, delay, size in (("Sent", 0, 82), ("Received", 118, 62)):
+            frames.append({"method": f"Network.webSocketFrame{method}", "params": {
+                "requestId": "synthetic-connection", "timestamp": index * 5 + delay / 1000,
+                "response": {"opcode": 2, "payloadData": b64encode(bytes(size)).decode("ascii")},
+            }})
+    trace.write_text(json.dumps(frames), encoding="utf-8")
+    report = run_command(executable, folder, env, "h5-inspect", trace, "--patterns")
+    patterns = report["traffic_patterns"]
+    if report["frame_count"] != 12 or len(patterns) != 1 or patterns[0]["period_ms"] != 5000:
+        raise ValueError("Standalone H5 replay did not identify the synthetic exchange.")
+
+    pairing_file = folder / "pairing.json"
+    output = folder / "h5-live.jsonl"
+    with output.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen([executable, "h5-live", "--port", "0", "--pair-file", pairing_file, "--json"],
+                                   cwd=folder, env=env, stdout=log)
+        try:
+            deadline = monotonic() + 20
+            while process.poll() is None and monotonic() < deadline:
+                if pairing_file.is_file() and pairing_file.stat().st_size and output.read_bytes().endswith(b"\n"):
+                    break
+                sleep(0.05)
+            else:
+                raise ValueError("Standalone H5 receiver did not create a pairing file.")
+            pairing = json.loads(pairing_file.read_text(encoding="utf-8"))
+            frame = {**report["frames"][0], "encoding": "binary"}
+            batch = {"capture_id": str(uuid4()), "batch_id": str(uuid4()), "frames": [frame]}
+            request = Request(pairing["url"], data=json.dumps(batch).encode("utf-8"), headers={
+                "Authorization": f"Bearer {pairing['token']}", "Content-Type": "application/json",
+            })
+            with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
+                if response.status != 204:
+                    raise ValueError("Standalone H5 receiver did not acknowledge the batch.")
+            terminal = output.read_text(encoding="utf-8")
+            events = [json.loads(line) for line in terminal.splitlines()]
+            if (pairing["token"] in terminal or [event.get("frames") for event in events[1:]] != [[frame]]):
+                raise ValueError("Unexpected standalone H5 receiver output.")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def main(executable):
     tests = Path(__file__).resolve().parents[1] / "tests"
     fixture_helpers = runpy.run_path(str(tests / "test_windows_ocr.py"))
@@ -193,6 +251,7 @@ def main(executable):
         if (recommendation["kind"], recommendation["amount"], recommendation["ev"]) != ("call", 20, 70):
             raise ValueError(f"Unexpected EV recommendation: {recommendation}")
 
+        assert_h5_capture(executable, folder, env)
         screenshot = folder / "牌桌.png"
         fixture_helpers["write_ocr_fixture"](screenshot)
         observation = run_command(executable, folder, env, "observe", screenshot)

@@ -73,6 +73,16 @@ def _parser():
     _add_window(capture)
     _add_output(capture)
 
+    h5 = commands.add_parser("h5-inspect", help="只读分析本地 Chrome WebSocket 抓包")
+    h5.add_argument("trace", type=Path, metavar="TRACE", help="Chrome HAR 或 DevTools Protocol Monitor JSON")
+    h5.add_argument("--patterns", action="store_true", help="检测可能的周期性往返消息")
+    _add_output(h5)
+
+    h5_live = commands.add_parser("h5-live", help="接收 Chrome 扩展的实时 WebSocket 消息摘要")
+    h5_live.add_argument("--port", type=int, default=8767, help="本机监听端口，0 表示自动选择")
+    h5_live.add_argument("--pair-file", type=Path, help="指定配对文件位置，默认在本机临时目录创建")
+    h5_live.add_argument("--json", action="store_true", help="逐行输出 JSON 事件")
+
     layout = commands.add_parser("layout-template", help="导出按位置比例配置的布局模板")
     layout.add_argument("--live", action="store_true", help="包含实时座位标记和按钮区域")
     _add_output(layout)
@@ -216,7 +226,51 @@ def _players(args):
         return result
 
 
+def _run_h5_live(args):
+    from .h5_live import serve_live
+    from .h5_traffic import TrafficAnalyzer
+
+    traffic = TrafficAnalyzer()
+
+    def emit(event):
+        if args.json:
+            print(json.dumps(event, ensure_ascii=False, allow_nan=False), flush=True)
+        elif event["type"] == "listening":
+            print(f"H5 本机监听 {event['url']}\n配对文件 {event['pairing_file']}", flush=True)
+        elif event["type"] == "frames":
+            for frame in event["frames"]:
+                direction = "下行" if frame["direction"] == "received" else "上行"
+                print(f"H5 +{frame['offset_ms'] / 1000:.3f}s {frame['connection']} {direction} "
+                      f"{frame['size_bytes']} B｜{frame['encoding']}", flush=True)
+        for pattern in traffic.update(event):
+            if args.json:
+                print(json.dumps(pattern, ensure_ascii=False, allow_nan=False), flush=True)
+            else:
+                print(pattern["message"], flush=True)
+
+    if args.pair_file is not None:
+        return serve_live(args.port, args.pair_file.expanduser(), emit)
+    with TemporaryDirectory(prefix="deep-stack-h5-") as folder:
+        return serve_live(args.port, Path(folder) / "h5-pairing.json", emit)
+
+
 def _run(args):
+    if args.command == "h5-live":
+        return _run_h5_live(args)
+    if args.command == "h5-inspect":
+        from .h5_trace import inspect_trace
+
+        trace = args.trace.expanduser()
+        if args.output is not None:
+            args.output = args.output.expanduser()
+            if args.output.resolve() == trace.resolve():
+                raise ValueError("H5 分析报告需要与原始抓包使用不同文件")
+        report = inspect_trace(trace)
+        if args.patterns:
+            from .h5_traffic import summarize_traffic
+
+            report["traffic_patterns"] = summarize_traffic(report["frames"])
+        return report
     if args.command in {"observe", "capture", "live"}:
         from .layout import load_profile
 
@@ -282,7 +336,7 @@ def main(argv=None):
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     except (KeyboardInterrupt, subprocess.TimeoutExpired):
-        if args.command == "live":
+        if args.command in {"live", "h5-live"}:
             return 0
         print("操作已中断或超时。", file=sys.stderr)
         return 130

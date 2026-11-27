@@ -10,7 +10,32 @@
 - 座位编号用于关联同一手牌的画面。余额是显示的剩余筹码，本轮投入和整手累计投入单独记录。动作日志只能记录采样到的变化。重复出现的同标签以及两帧之间的动作，需要用完整牌谱补齐。截图缩放、遮挡、动画和主题会影响识别，自动回归使用固定合成截图序列。
 - `wpk.com` 官网公开说明会打击伙牌和作弊。截至 2026 年 11 月 26 日，在官网及其新闻、下载、品牌等公开入口中尚未核实到对第三方实时辅助的官方条款。识别验证使用本地合成数据。[WPK 官网](https://www.wpk.com/) · [WPK H5](https://h5.wpk.com/)
 
-登录页面刷新时，浏览器开发者工具显示普通 Fetch/XHR 请求和两条握手状态为 `101` 的 `wss://` 连接。可在 Chrome 的 Network 面板勾选 Keep log，按 Socket 筛选，再选择连接的 Messages 查看时刻、方向和长度。一次现场观察中，一条连接显示了多条二进制消息，尚未核实这些消息与座位、筹码、动作或固定 ID 的对应关系。程序目前通过屏幕识别获取牌局信息。[Chrome Network 文档](https://developer.chrome.com/docs/devtools/network/reference/#websocket-messages)
+## H5 网络观察
+
+Chrome 开发者工具的 Network 面板可观察当前登录会话。勾选 Keep log，在过滤框填 `resource-type:websocket is:running`，选择状态 `101` 的连接后打开 Messages，可核对收发方向、时间和消息长度。已有连接可直接观察。[Chrome Network 文档](https://developer.chrome.com/docs/devtools/network/reference/#websocket-messages)
+
+先在 Network 面板选择 **Export HAR (sanitized)**，将文件保存到下载目录，例如命名为 `h5-wpk.har`。然后在项目目录运行以下命令。若保存到了其他位置或使用了不同文件名，请把第一个参数换成实际导出的文件路径。同样可以传入 Protocol Monitor 导出的 JSON 路径。[Protocol Monitor](https://developer.chrome.com/docs/devtools/protocol-monitor)
+
+```bash
+python3 -m deep_stack h5-inspect "$HOME/Downloads/h5-wpk.har" -o "$HOME/Downloads/h5-summary.json"
+```
+
+`h5-inspect` 读取已有文件。缺少输入文件时，它会报告查找的路径。
+
+报告含匿名连接编号、相对时间、方向、操作码、字节长度和编码特征计数。Chrome 的清理版 HAR 仍可能带有原始消息与请求地址，适合在本机处理和分享派生的 `h5-summary.json`。样本较大时，可缩短采样窗口或筛选当前连接后导出。当前样本确认能持续采到二进制消息，座位、筹码、公共牌和动作字段尚待用可见牌局逐项对照。实时牌局识别目前仍由屏幕入口提供。[Chromium HAR 导出实现](https://github.com/ChromeDevTools/devtools-frontend/blob/main/front_end/models/har/Log.ts#L139-L176)
+
+### 实时采集
+
+启动本机接收程序。终端会显示配对文件的位置。`--json` 输出机器可读的 JSON 行，供本机程序接入。
+
+```bash
+deep-stack h5-live
+deep-stack h5-live --port 0 --json
+```
+
+Chrome 118 或以上可在 `chrome://extensions` 加载未打包的扩展，源码目录为 `extensions/wpk-h5-capture`，独立包内为 `wpk-h5-capture`。关闭同一 WPK 标签页已打开的 DevTools，在 `https://h5.wpk.com` 标签页打开扩展，选择终端显示的配对文件，点击「开始采集」。系统文件选择器如果关掉了小弹窗，可以用「在独立窗口配对」。采集时 Chrome 会显示调试提示。扩展的「停止采集」、关闭目标标签页或离开 WPK 会结束采集。接收程序重启后使用新生成的配对文件。[Chrome Debugger API](https://developer.chrome.com/docs/extensions/reference/api/debugger)
+
+接收程序只监听 `127.0.0.1`。扩展在本地生成帧的时间、方向、操作码、字节数与编码标签，HTTP 批次只带这些元数据和匿名标识。配对令牌由本地文件提供，监听停止后配对失效。终端会把满足周期和延迟条件的往返标为「可能是保活或轮询」。可用 `h5-inspect --patterns` 对已导出的文件做同样的检测。牌局事件仍需要可验证的字段映射后才能进入 EV 分析。[CDP WebSocket 帧定义](https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-WebSocketFrame)
 
 ## 安装与启动
 

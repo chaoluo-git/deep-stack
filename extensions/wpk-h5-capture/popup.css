@@ -1,0 +1,26 @@
+:root {
+  color-scheme: light dark;
+  font: 13px/1.55 system-ui, sans-serif;
+  background: light-dark(#fafaf7, #20241f);
+  color: light-dark(#181f18, #edf0e7);
+}
+body { margin: 0; min-width: 286px; }
+main { padding: 18px; }
+h1 { margin: 0 0 7px; font-size: 20px; line-height: 1.25; }
+p { margin: 0 0 12px; }
+#capture-stats, #pairing-status { color: light-dark(#4a564a, #c0cabb); }
+#pairing-status { margin: 5px 0 0; }
+#pairing-status:empty { display: none; }
+#open-pairing-window { margin-top: 8px; background: transparent; }
+label { display: block; margin-bottom: 4px; font-weight: 600; }
+input { box-sizing: border-box; width: 100%; }
+.actions { display: flex; gap: 8px; margin-top: 14px; }
+button {
+  border: 1px solid light-dark(#a7b4a6, #667866);
+  border-radius: 6px;
+  padding: 6px 16px;
+  font: inherit;
+  cursor: pointer;
+}
+button[type=submit]:enabled { color: white; background: #28563c; border-color: #28563c; }
+button:disabled { cursor: default; }

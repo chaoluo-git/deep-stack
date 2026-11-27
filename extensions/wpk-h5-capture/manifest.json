@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Deep Stack · WPK 帧采集",
+  "version": "1.0.0",
+  "description": "手动启动后，将选中的 WPK 标签页的 WebSocket 帧元数据发给本机 Deep Stack。",
+  "minimum_chrome_version": "118",
+  "permissions": ["activeTab", "debugger", "webNavigation"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {"service_worker": "background.mjs", "type": "module"},
+  "action": {"default_popup": "popup.html"}
+}

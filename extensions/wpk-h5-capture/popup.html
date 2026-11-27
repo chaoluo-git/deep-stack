@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WPK 帧采集</title>
+  <link rel="stylesheet" href="popup.css">
+  <script type="module" src="popup.mjs"></script>
+</head>
+<body>
+  <main>
+    <h1>WPK 帧采集</h1>
+    <p id="capture-status" role="status">正在读取采集状态。</p>
+    <p id="capture-stats" hidden></p>
+    <form id="capture-form">
+      <div id="pairing-field" hidden>
+        <label for="pairing-file">本机配对文件</label>
+        <input id="pairing-file" type="file" accept=".json,application/json">
+        <p id="pairing-status" aria-live="polite"></p>
+        <button id="open-pairing-window" type="button" hidden>在独立窗口配对</button>
+      </div>
+      <div class="actions">
+        <button id="start-capture" type="submit" disabled>开始</button>
+        <button id="stop-capture" type="button" disabled>停止</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>
