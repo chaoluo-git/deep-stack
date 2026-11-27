@@ -187,6 +187,8 @@ def assert_h5_capture(executable, folder, env):
     extension = executable.parent / "wpk-h5-capture"
     if not all((extension / name).is_file() for name in ("manifest.json", "background.mjs", "popup.html")):
         raise ValueError("Missing Chrome capture extension in the standalone package.")
+    if not (executable.parent / "docs" / "h5-action-collection.md").is_file():
+        raise ValueError("Missing H5 action collection documentation in the standalone package.")
 
     trace = folder / "synthetic-h5.json"
     frames = []

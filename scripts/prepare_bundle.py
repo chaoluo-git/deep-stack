@@ -17,6 +17,8 @@ def prepare_bundle(folder: Path) -> None:
     if license_path is None:
         raise FileNotFoundError("Could not locate the bundled Python runtime's license.")
     copyfile(project / "README.md", folder / "README.md")
+    (folder / "docs").mkdir(exist_ok=True)
+    copyfile(project / "docs" / "h5-action-collection.md", folder / "docs" / "h5-action-collection.md")
     copyfile(license_path, folder / "PYTHON-LICENSE.txt")
     copytree(project / "extensions" / "wpk-h5-capture", folder / "wpk-h5-capture",
              dirs_exist_ok=True, ignore=ignore_patterns("test"))
