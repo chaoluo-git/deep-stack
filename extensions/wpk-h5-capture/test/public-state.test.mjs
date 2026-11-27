@@ -14,9 +14,11 @@ function tableFixture() {
     spCardList: [313, 203, 411, 110, 213].map((name) => ({ node: node(), spriteFrame: { name: String(name) } })),
     spSeeCardBordList: Array.from({ length: 5 }, () => node({ activeInHierarchy: false })),
   };
+  const room = { lblBetStep: label("2/4(2)") };
   const table = {
     node: node(),
     comCards: { getComponent: () => board },
+    roomInfo: { getComponent: (name) => name === "roomInfo" ? room : null },
   };
   const controller = { node: node(), _gameUI: table, _roundData: { round: "RIVER" } };
   const info = {
@@ -27,6 +29,8 @@ function tableFixture() {
     lblActionState: label("跟注"),
     ndStateBg: node(),
     lblNickname: label("", { activeInHierarchy: false }),
+    ndD: node(),
+    ndDAni: node({ activeInHierarchy: false }),
     lblFold: label("弃牌", { opacity: 0 }),
     isFold: false,
     ndAllin: node({ activeInHierarchy: false }),
@@ -64,7 +68,7 @@ function tableFixture() {
     },
   };
   root.top = root;
-  return { root, scene, board, seat, info, controller, modules, model, portal };
+  return { root, scene, board, seat, info, controller, modules, model, portal, room, table };
 }
 
 test("reads an exact bounded snapshot from the active public scene", () => {
@@ -73,6 +77,7 @@ test("reads an exact bounded snapshot from the active public scene", () => {
     table_ref: "9007199254740998",
     hand_ref: "75",
     street: "river",
+    table_details: { small_blind: 2, big_blind: 4, ante: 2, third_blind: null, dealer_slot: 3 },
     board: ["Kc", "3h", "Jd", "Ts", "Kh"],
     seats: [{ slot: 3, player_id: "9007199254740999", action: "call", wager: 1500, stack: 19500 }],
   };
@@ -203,4 +208,45 @@ test("requires matching precise table references and trusts a plain visible amou
   assert.equal(readPublicState(root).table_ref, null);
   portal.roomId = root.CurrentUserInfo.roomId = Number("9007199254740998");
   assert.equal(readPublicState(root).table_ref, null);
+});
+
+test("reads only a valid visible table-stakes caption and leaves omitted values unknown", () => {
+  const { root, room, table } = tableFixture();
+  room.lblBetStep.string = "0.25/0.5/1(0.1)";
+  assert.deepEqual(readPublicState(root).table_details, {
+    small_blind: 0.25, big_blind: 0.5, ante: 0.1, third_blind: 1, dealer_slot: 3,
+  });
+  room.lblBetStep.string = "2/4";
+  assert.deepEqual(readPublicState(root).table_details, {
+    small_blind: 2, big_blind: 4, ante: null, third_blind: null, dealer_slot: 3,
+  });
+  const missing = { small_blind: null, big_blind: null, ante: null, third_blind: null, dealer_slot: 3 };
+  for (const malformed of ["", "4/2", "2/4/3", "2/4(0)", "2/1000000000001", "2/4 chips", "2(Dx2)"]) {
+    room.lblBetStep.string = malformed;
+    assert.deepEqual(readPublicState(root).table_details, missing, malformed);
+  }
+  room.lblBetStep.string = "2/4(2)";
+  room.lblBetStep.node.opacity = 0;
+  assert.deepEqual(readPublicState(root).table_details, missing);
+  delete table.roomInfo;
+  assert.deepEqual(readPublicState(root).table_details, missing);
+});
+
+test("requires a single static dealer marker bound to an occupied table seat", () => {
+  const { root, info, modules, seat } = tableFixture();
+  assert.equal(readPublicState(root).table_details.dealer_slot, 3);
+  info.ndDAni.activeInHierarchy = true;
+  assert.equal(readPublicState(root).table_details.dealer_slot, null);
+  info.ndDAni.activeInHierarchy = false;
+  const secondData = { seatNum: 4, userId: "123456" };
+  const second = { ...seat, _data: secondData, useInfoJs: { ...info, _data: secondData, ndD: node() } };
+  modules.seat.push(second);
+  assert.equal(readPublicState(root).table_details.dealer_slot, null);
+  second.useInfoJs.ndD.activeInHierarchy = false;
+  assert.equal(readPublicState(root).table_details.dealer_slot, 3);
+  second.useInfoJs.ndDAni = node();
+  assert.equal(readPublicState(root).table_details.dealer_slot, null);
+  second.useInfoJs.ndDAni.activeInHierarchy = false;
+  info._data = null;
+  assert.equal(readPublicState(root).table_details.dealer_slot, null);
 });

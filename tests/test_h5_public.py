@@ -12,10 +12,20 @@ def seat(slot=1, *, player_id=None, action=None, wager=None, stack=None):
     return {"slot": slot, "player_id": player_id, "action": action, "wager": wager, "stack": stack}
 
 
-def snapshot(offset, *, table_ref="29", hand_ref="72", street="preflop", board=(), seats=()):
-    return {
+def snapshot(offset, *, table_ref="29", hand_ref="72", street="preflop", board=(), seats=(), table_details=None):
+    result = {
         "offset_ms": offset, "table_ref": table_ref, "hand_ref": hand_ref, "street": street,
         "board": list(board), "seats": list(seats),
+    }
+    if table_details is not None:
+        result["table_details"] = table_details
+    return result
+
+
+def table_details(*, small_blind=None, big_blind=None, ante=None, third_blind=None, dealer_slot=None):
+    return {
+        "small_blind": small_blind, "big_blind": big_blind, "ante": ante,
+        "third_blind": third_blind, "dealer_slot": dealer_slot,
     }
 
 
@@ -112,6 +122,52 @@ class H5PublicTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "时间顺序"):
             self.accept(snapshot(11, hand_ref="73"))
         self.assertEqual(self.capture.accept(str(uuid4()), [initial])[0]["type"], "public_table")
+
+    def test_optional_table_details_validate_complete_allowlist_and_clear_unobserved_dealer(self):
+        inputs = snapshot(0, seats=[seat(3)], table_details=table_details(
+            small_blind=0.5, big_blind=1, ante=0.1, third_blind=2, dealer_slot=3,
+        ))
+        validated = validate_snapshot(inputs)
+        self.assertEqual(validated, inputs)
+        inputs["table_details"]["dealer_slot"] = 7
+        missing_dealer = validate_snapshot(inputs)
+        self.assertEqual(validated["table_details"]["dealer_slot"], 3)
+        self.assertIsNone(missing_dealer["table_details"]["dealer_slot"])
+        self.assertEqual(missing_dealer["table_details"]["big_blind"], 1)
+        self.assertNotIn("table_details", validate_snapshot(snapshot(0)))
+
+        for bad in (
+            None, {**table_details(), "small_blind_slot": 2}, {"dealer_slot": 3},
+            table_details(small_blind=2), table_details(big_blind=2),
+            table_details(small_blind=2, big_blind=1), table_details(ante=0),
+            table_details(ante=True), table_details(ante="1"), table_details(ante=1e12 + 1),
+            table_details(third_blind=float("inf")), table_details(dealer_slot=0),
+            table_details(dealer_slot=True), table_details(dealer_slot=10),
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate_snapshot({**snapshot(0), "table_details": bad})
+
+    def test_table_detail_changes_and_clear_are_observed_without_replaying_actions(self):
+        both = [seat(2, action="call", wager=2), seat(4)]
+        first = table_details(small_blind=1, big_blind=2, ante=0.5, dealer_slot=2)
+        changed = {**first, "dealer_slot": 4}
+        events = self.accept(
+            snapshot(0, seats=both),
+            snapshot(1, seats=both, table_details=first),
+            snapshot(2, seats=both, table_details=dict(first)),
+            snapshot(3, seats=both, table_details=changed),
+            snapshot(4, seats=both[:1], table_details=changed),
+            snapshot(5, seats=both[:1], table_details=table_details()),
+            snapshot(6, seats=both[:1]),
+        )
+        tables = select(events, "table")
+        self.assertEqual([(item["offset_ms"], item.get("table_details")) for item in tables], [
+            (0, None), (1, first), (3, changed), (4, {**changed, "dealer_slot": None}),
+            (5, table_details()), (6, None),
+        ])
+        self.assertIsNot(tables[1]["table_details"], first)
+        self.assertEqual([event["offset_ms"] for event in select(events, "action")], [0])
+        self.assertTrue(all("table_details" not in event for event in select(events, "action")))
 
     def test_observes_complete_boards_and_ignores_incomplete_or_nonprogressive_rendering(self):
         flop = ("As", "Td", "4c")

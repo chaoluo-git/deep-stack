@@ -65,11 +65,20 @@ deep-stack players --db players.sqlite3 show 001234 --events 20
 
 当前观察事件包括 `public_table`、`public_board`、`public_identity`、`public_chips` 和 `public_action`。牌桌 ID 由两个客户端模型核对，手号取官方回顾引用的当前手号。玩家 ID 以同帧座位与头像资料来源一致且唯一为准，冲突或不完整时留空。只有具备已确认桌号、手号、街次和玩家的观察动作才进入玩家动作统计。`wager` 是当街可见累计投入，`stack` 是可见剩余筹码读数。数字标签按界面读数记录，带单位时要求客户端的金额格式化结果与显示一致。
 
+`public_table.table_details` 记录公开盲注标签中的 `small_blind`、`big_blind`、`ante` 和可选 `third_blind`。现场样本 `2/4(2)` 对应小盲 2、大盲 4、前注 2。`dealer_slot` 取唯一可见的静态 `D` 标记，标记在移动或无法和当前座位核对时留空。大小盲的具体座位需要同手牌谱核对。
+
 界面标签可能停留并晚于实际动作。采集会合并可识别的重复标签，标签相同而累计投入增加时可保留读数更新 `wager_update`。累计投入可在 `h5-public-show` 中查询。`players show` 中的动作统计不会把动画期间的累计投入算作单次动作金额。两次采样之间可以漏过动作，同帧也无法确认各座位的先后顺序。缺少整手观测时应以官方回顾核对。打开牌桌右上角叠牌图标后可逐手比对公牌、各街动作和金额。该接收器用于观战与赛后回查，实时 EV 建议有独立的决策条件和入口。`h5-live` 与 `h5-profile` 用于网络帧和封包分析。
 
 ## 实时包采集、封包分析和核对
 
 `h5-live` 实时写入网络帧元数据，`h5-profile` 对本机导出的 HAR 或 CDP 捕获做二进制结构检查。
+
+| 路径 | 转换 | 本机输出 |
+| --- | --- | --- |
+| `h5-live` | 从 Chrome CDP `Network.webSocketFrameSent` / `Network.webSocketFrameReceived` 读取帧。在扩展中按 opcode 检查文本或 Base64 表示，计算长度和相对时间，提取编码特征及匿名连接号。`/v1/frames` 接收通过鉴权和字段校验的批次。 | 终端或 `--journal` JSONL 中的 `h5_batch`，带接收时间、抓包批次和帧元数据。原始帧、解密内容和玩家动作均无 SQLite 记录。 |
+| `h5-public` | 读取正在显示的观战客户端组件，筛选公牌、动作标签、座位、身份及桌况。`/v1/public` 校验快照并按手、街和座位提取变化。 | SQLite `h5_public_observations` 存观察，`source` 为 `h5_client_display`。同帧桌号、手号、街次和唯一玩家 ID 都核实后才写入 `hand_seats` 和 `visible_actions`，供玩家统计。 |
+
+`h5-inspect` 和 `h5-profile` 的输入是本机已保存的 HAR 或 CDP 捕获，产物是 JSON 网络摘要或封包结构统计。本批原始二进制帧的业务字段仍待验证。`h5-public-show --player ID` 可在混用过不同采集模式的本机数据库里单独查看该玩家的 H5 客户端观察。
 
 ```bash
 deep-stack h5-live --port 0 --journal network-session.jsonl --json

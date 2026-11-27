@@ -336,6 +336,15 @@ def _print_h5_public(event, json_lines):
 
     if json_lines:
         print(json.dumps(_redact_h5_public(event), ensure_ascii=False, allow_nan=False), flush=True)
+    elif event["type"] == "public_table" and "table_details" in event:
+        details = event["table_details"]
+        small, big = details["small_blind"], details["big_blind"]
+        blinds = f"{small:g}/{big:g}" if small is not None else "待核对"
+        if details["third_blind"] is not None:
+            blinds += f"/{details['third_blind']:g}"
+        ante = f"{details['ante']:g}" if details["ante"] is not None else "待核对"
+        dealer = f"槽位 {details['dealer_slot']}" if details["dealer_slot"] is not None else "待核对"
+        print(f"H5 牌桌｜盲注 {blinds}｜ante {ante}｜庄位 {dealer}", flush=True)
     elif event["type"] == "public_board" and event["board"]:
         print(f"H5 公共牌  {' '.join(event['board'])}", flush=True)
     elif event["type"] == "public_action":

@@ -283,8 +283,9 @@ def assert_h5_public(executable, folder, env):
     database = folder / "h5-public.sqlite3"
     player_id = "00902173"
     seat = {"slot": 4, "player_id": player_id, "action": None, "wager": 0, "stack": 100}
+    details = {"small_blind": 2, "big_blind": 4, "ante": 2, "third_blind": None, "dealer_slot": 4}
     preflop = {"offset_ms": 0, "table_ref": "8821", "hand_ref": "7293601", "street": "preflop",
-               "board": [], "seats": [seat]}
+               "board": [], "table_details": details, "seats": [seat]}
     flop = {**preflop, "offset_ms": 500, "street": "flop", "board": ["As", "Kc", "6d"],
             "seats": [{**seat, "action": "bet", "wager": 12, "stack": 88}]}
     turn = {**flop, "offset_ms": 1000, "hand_ref": None, "street": "turn", "board": [*flop["board"], "Th"],
@@ -305,9 +306,12 @@ def assert_h5_public(executable, folder, env):
 
     observed = run_command(executable, folder, env, "h5-public-show", "--db", database)["events"]
     board = [event["board"] for event in observed if event["type"] == "public_board" and event["board"]]
+    table_details = [event["table_details"] for event in observed if event["type"] == "public_table"]
     if (board != [turn["board"], flop["board"]]
+            or table_details != [details, details, details]
             or [event for event in observed if event["type"] == "public_action"] != list(reversed(actions))
-            or any(private_fields.intersection(event) for event in observed)):
+            or any(event["source"] != "h5_client_display" or private_fields.intersection(event)
+                   for event in observed)):
         raise ValueError("Standalone public H5 history did not persist the expected redacted observations.")
     identified = run_command(
         executable, folder, env, "h5-public-show", "--db", database, "--player", player_id, "--identities",

@@ -11,10 +11,14 @@ from .ev import KINDS, RANKS, SUITS
 
 _MAX_SAFE_INTEGER = 2**53 - 1
 MAX_PUBLIC_SNAPSHOTS = 32
+PUBLIC_SOURCE = "h5_client_display"
 _MAX_CAPTURES = 128
 _REF = re.compile(r"[0-9]{1,24}")
 _FIELDS = {"offset_ms", "table_ref", "hand_ref", "street", "board", "seats"}
 _SEAT_FIELDS = {"slot", "player_id", "action", "wager", "stack"}
+_TABLE_AMOUNTS = ("small_blind", "big_blind", "ante", "third_blind")
+_TABLE_DETAILS_FIELDS = {*_TABLE_AMOUNTS, "dealer_slot"}
+_TABLE_KEYS = ("table_ref", "hand_ref", "street", "table_details")
 _BOARD_COUNTS = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 _STREETS = (*_BOARD_COUNTS, "settled")
 _STREET_ORDER = {street: index for index, street in enumerate(_STREETS)}
@@ -31,9 +35,27 @@ def _valid_chips(value):
     return value is None or (type(value) in (int, float) and 0 <= value <= 1e12)
 
 
+def _table_details(details, slots):
+    if not isinstance(details, dict) or details.keys() != _TABLE_DETAILS_FIELDS:
+        raise ValueError("公开牌桌桌况字段无效")
+    amounts = {name: details[name] for name in _TABLE_AMOUNTS}
+    if any(not _valid_chips(value) or value == 0 for value in amounts.values()):
+        raise ValueError("公开牌桌盲注或前注金额无效")
+    small, big = amounts["small_blind"], amounts["big_blind"]
+    if (small is None) != (big is None) or (small is not None and small > big):
+        raise ValueError("公开牌桌大小盲注不一致")
+    third = amounts["third_blind"]
+    if third is not None and (big is None or third <= big):
+        raise ValueError("公开牌桌第三盲注无效")
+    dealer = details["dealer_slot"]
+    if dealer is not None and (type(dealer) is not int or not 1 <= dealer <= 9):
+        raise ValueError("公开牌桌庄位编号无效")
+    return {**amounts, "dealer_slot": dealer if dealer in slots else None}
+
+
 def validate_snapshot(snapshot):
     """Return an independent allowlisted snapshot, or raise ValueError."""
-    if not isinstance(snapshot, dict) or snapshot.keys() != _FIELDS:
+    if not isinstance(snapshot, dict) or not _FIELDS <= snapshot.keys() <= _FIELDS | {"table_details"}:
         raise ValueError("公开牌桌快照字段无效")
     offset = snapshot["offset_ms"]
     if type(offset) is not int or not 0 <= offset <= _MAX_SAFE_INTEGER:
@@ -70,10 +92,13 @@ def validate_snapshot(snapshot):
             raise ValueError("公开牌桌筹码读数无效")
         slots.add(slot)
 
-    return {
+    validated = {
         **snapshot, "board": list(board),
         "seats": [dict(seat) for seat in sorted(seats, key=lambda seat: seat["slot"])],
     }
+    if "table_details" in snapshot:
+        validated["table_details"] = _table_details(snapshot["table_details"], slots)
+    return validated
 
 
 def _capture_ref(value):
@@ -199,13 +224,16 @@ class _CaptureState:
             and (bool(self.board) or self.street == "settled")
         )
         event = {
-            "capture_id": capture_id, "offset_ms": snapshot["offset_ms"],
+            "source": PUBLIC_SOURCE, "capture_id": capture_id, "offset_ms": snapshot["offset_ms"],
             "table_ref": table_ref, "hand_ref": hand_ref, "street": street,
             "confirmed_hand": hand_ref is not None,
         }
         events = []
-        if self.latest is None or any(snapshot[key] != self.latest[key] for key in ("table_ref", "hand_ref", "street")):
-            events.append({"type": "public_table", **event})
+        if self.latest is None or any(snapshot.get(key) != self.latest.get(key) for key in _TABLE_KEYS):
+            table_event = {"type": "public_table", **event}
+            if "table_details" in snapshot:
+                table_event["table_details"] = dict(snapshot["table_details"])
+            events.append(table_event)
         if not street_regressed and self.board_event(snapshot, scope_changed):
             events.append({"type": "public_board", **event, "board": list(self.board)})
 

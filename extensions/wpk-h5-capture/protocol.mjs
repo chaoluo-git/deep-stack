@@ -70,7 +70,9 @@ export function isFrameEvent(method) {
 const PUBLIC_STREETS = new Set([null, "preflop", "flop", "turn", "river", "settled"]);
 const PUBLIC_ACTIONS = new Set([null, "fold", "check", "call", "bet", "raise", "all_in"]);
 const SNAPSHOT_FIELDS = ["table_ref", "hand_ref", "street", "board", "seats"];
+const SNAPSHOT_WITH_DETAILS_FIELDS = [...SNAPSHOT_FIELDS, "table_details"];
 const SEAT_FIELDS = ["slot", "player_id", "action", "wager", "stack"];
+const TABLE_DETAILS_FIELDS = ["small_blind", "big_blind", "ante", "third_blind", "dealer_slot"];
 
 function hasFields(value, fields) {
   return value && typeof value === "object" && !Array.isArray(value) &&
@@ -87,8 +89,10 @@ function isAmount(value) {
 }
 
 export function publicSnapshot(value, offset_ms) {
-  if (!Number.isSafeInteger(offset_ms) || offset_ms < 0 || !hasFields(value, SNAPSHOT_FIELDS)) return null;
-  const {table_ref, hand_ref, street, board, seats} = value;
+  const withDetails = value && Object.hasOwn(value, "table_details");
+  const fields = withDetails ? SNAPSHOT_WITH_DETAILS_FIELDS : SNAPSHOT_FIELDS;
+  if (!Number.isSafeInteger(offset_ms) || offset_ms < 0 || !hasFields(value, fields)) return null;
+  const {table_ref, hand_ref, street, board, seats, table_details} = value;
   if (!isPublicRef(table_ref) || !isPublicRef(hand_ref) || !PUBLIC_STREETS.has(street) ||
       !Array.isArray(board) || board.length > 5 || !Array.isArray(seats) || seats.length > 9) return null;
 
@@ -107,5 +111,16 @@ export function publicSnapshot(value, offset_ms) {
     slots.add(slot);
     players.push({slot, player_id, action, wager, stack});
   }
-  return {offset_ms, table_ref, hand_ref, street, board: cards, seats: players};
+  const snapshot = {offset_ms, table_ref, hand_ref, street, board: cards, seats: players};
+  if (!withDetails) return snapshot;
+  if (!hasFields(table_details, TABLE_DETAILS_FIELDS)) return null;
+  const {small_blind, big_blind, ante, third_blind, dealer_slot} = table_details;
+  if ([small_blind, big_blind, ante, third_blind].some(amount => !isAmount(amount) || amount === 0) ||
+      (small_blind === null) !== (big_blind === null) || small_blind > big_blind ||
+      (third_blind !== null && (big_blind === null || third_blind <= big_blind)) ||
+      (dealer_slot !== null && (!Number.isInteger(dealer_slot) || dealer_slot < 1 || dealer_slot > 9))) return null;
+  snapshot.table_details = {
+    small_blind, big_blind, ante, third_blind, dealer_slot: slots.has(dealer_slot) ? dealer_slot : null,
+  };
+  return snapshot;
 }

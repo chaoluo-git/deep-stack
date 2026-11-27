@@ -12,7 +12,7 @@
 
 ## H5 观战采集
 
-打开 Chrome 里的 WPK H5 德州观战牌桌，保持目标标签页可见。该模式直接读取官网客户端已显示的牌桌状态，将变化保存到本机 SQLite。
+打开 Chrome 里的 WPK H5 德州观战牌桌，保持目标标签页可见。该模式直接读取官网客户端已显示的牌桌状态，将变化保存到本机 SQLite。查询中的 `source: "h5_client_display"` 标明这批观察来自客户端画面组件。WebSocket 抓包的元数据由 `h5-live` 单独记录。
 
 ```bash
 deep-stack h5-public --db players.sqlite3
@@ -20,7 +20,7 @@ deep-stack h5-public --db players.sqlite3
 
 1. 在 Chrome 118 或以上打开 `chrome://extensions`，启用「开发者模式」后加载未打包的扩展。源码目录为 `extensions/wpk-h5-capture`，独立包内为 `wpk-h5-capture`。已有扩展时重新加载即可。
 2. 关闭目标标签页的 DevTools。在 WPK 标签页打开「WPK 采集」扩展，选择终端显示的本机配对文件。看到「准备采集公开牌桌快照」后点击「开始」。文件选择器关闭弹窗时，可选「在独立窗口配对」。
-3. 终端会显示已观察到的动作、公牌和身份确认状态。结束时点击扩展的「停止」，再按 `Ctrl+C` 关闭本机接收程序。重启接收程序后使用新配对文件。
+3. 终端会显示已观察到的动作、公牌、盲注金额、前注和庄位。盲注金额来自牌桌的公开标签，庄位来自可见的 `D` 标记。结束时点击扩展的「停止」，再按 `Ctrl+C` 关闭本机接收程序。重启接收程序后使用新配对文件。
 
 ```bash
 deep-stack h5-public-show --db players.sqlite3 --limit 30

@@ -371,6 +371,8 @@ class PlayerStore:
 
     def h5_public_events(self, *, limit=100, player_id=None):
         """Return recent H5 display observations, newest first."""
+        from .h5_public import PUBLIC_SOURCE
+
         limit = _history_limit(limit)
         if player_id is None:
             rows = self._db.execute(
@@ -381,7 +383,7 @@ class PlayerStore:
                 "SELECT payload FROM h5_public_observations WHERE player_id = ? ORDER BY event_id DESC LIMIT ?",
                 (_player_id(player_id), limit),
             )
-        return [json.loads(row["payload"]) for row in rows]
+        return [{"source": PUBLIC_SOURCE, **json.loads(row["payload"])} for row in rows]
 
     def _record_action(self, key, kind, street, wager):
         rows = self._db.execute(

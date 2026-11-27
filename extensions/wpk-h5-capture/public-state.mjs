@@ -109,6 +109,21 @@ export function readPublicState(root) {
     }
   }
 
+  function tableStakes(table) {
+    const unknown = { small_blind: null, big_blind: null, ante: null, third_blind: null };
+    const room = table.roomInfo?.getComponent?.("roomInfo");
+    const text = label(room?.lblBetStep);
+    if (!text || text.length > 100) return unknown;
+    // roomInfo.setBB renders SB/BB, optionally /third and then (ante).
+    const match = /^([0-9]+(?:\.[0-9]+)?)\/([0-9]+(?:\.[0-9]+)?)(?:\/([0-9]+(?:\.[0-9]+)?))?(?:\(([0-9]+(?:\.[0-9]+)?)\))?$/.exec(text);
+    if (!match) return unknown;
+    const stakes = match.slice(1).map((value) => value === undefined ? null : Number(value));
+    const [small, big, third, ante] = stakes;
+    if (stakes.some((value) => value !== null && (!Number.isFinite(value) || value <= 0 || value > 1e12)) ||
+        small > big || (third !== null && third <= big)) return unknown;
+    return { small_blind: small, big_blind: big, ante, third_blind: third };
+  }
+
   function publicBoard(component, street) {
     const result = [];
     if (!visible(component)) return result;
@@ -144,11 +159,17 @@ export function readPublicState(root) {
     const seats = [];
     const usedSlots = new Set();
     const playerClaims = new Map();
+    let dealerMarkers = 0;
+    let dealerAnimating = false;
+    let dealerSlot = null;
 
     for (const seat of active("seat")) {
       const info = seat.useInfoJs;
-      if (seat._gameUIJs !== table || !visibleNode(seat.ndContentSeat) || !visible(info) ||
-          !visibleNode(info.AvatarNode)) continue;
+      if (seat._gameUIJs !== table || !visible(info)) continue;
+      const markedDealer = visibleNode(info.ndD);
+      if (markedDealer) dealerMarkers += 1;
+      if (visibleNode(info.ndDAni)) dealerAnimating = true;
+      if (!visibleNode(seat.ndContentSeat) || !visibleNode(info.AvatarNode)) continue;
       if (info._isSelf === true) return null;
 
       // The seat and avatar bind the same player. Opening that avatar's public
@@ -164,6 +185,7 @@ export function readPublicState(root) {
       if (slot < 1 || slot > 9 || Number(decimalReference(info._data?.seatNum)) !== slot) continue;
       if (usedSlots.has(slot)) return null;
       usedSlots.add(slot);
+      if (markedDealer) dealerSlot = slot;
       const playerId = seatId === avatarId ? seatId : null;
       seats.push({
         slot,
@@ -178,11 +200,14 @@ export function readPublicState(root) {
     for (const seat of seats) {
       if (playerClaims.get(seat.player_id)?.size > 1) seat.player_id = null;
     }
+    const dealerBound = seats.some(({ slot, player_id }) => slot === dealerSlot && player_id !== null);
+    if (dealerAnimating || dealerMarkers !== 1 || !dealerBound) dealerSlot = null;
 
     return {
       table_ref: liveTableReference(),
       hand_ref: hand?.hand ?? null,
       street,
+      table_details: { ...tableStakes(table), dealer_slot: dealerSlot },
       board: publicBoard(table.comCards?.getComponent("comCards"), street),
       seats: seats.sort((a, b) => a.slot - b.slot),
     };

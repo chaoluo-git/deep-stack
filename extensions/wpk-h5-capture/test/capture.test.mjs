@@ -16,6 +16,7 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const snapshot = {
   table_ref: "0017", hand_ref: "95", street: "flop", board: ["As", "2c", "Qh"],
   seats: [{slot: 2, player_id: "0081", action: "call", wager: 20, stack: 540.5}],
+  table_details: {small_blind: 2, big_blind: 4, ante: 2, third_blind: null, dealer_slot: 2},
 };
 
 async function until(predicate) {
@@ -151,6 +152,8 @@ test("validates and copies only the public snapshot schema before queuing", () =
   assert.deepEqual(copied, {offset_ms: 18, ...snapshot});
   assert.notEqual(copied.board, snapshot.board);
   assert.notEqual(copied.seats[0], snapshot.seats[0]);
+  assert.notEqual(copied.table_details, snapshot.table_details);
+  assert.equal(publicSnapshot({...snapshot, seats: []}, 18).table_details.dealer_slot, null);
   for (const value of [
     {...snapshot, rawPacket: "PRIVATE"}, {...snapshot, table_ref: "00"}, {...snapshot, hand_ref: "95\n"},
     {...snapshot, board: ["As", "As"]}, {...snapshot, board: ["As\n"]},
@@ -160,6 +163,11 @@ test("validates and copies only the public snapshot schema before queuing", () =
     {...snapshot, seats: [{...snapshot.seats[0], stack: 1e13}]},
     {...snapshot, seats: [{...snapshot.seats[0], wager: Infinity}]},
     {...snapshot, seats: [{...snapshot.seats[0], name: "PRIVATE"}]},
+    {...snapshot, table_details: null},
+    {...snapshot, table_details: {...snapshot.table_details, small_blind: 5}},
+    {...snapshot, table_details: {...snapshot.table_details, ante: 0}},
+    {...snapshot, table_details: {...snapshot.table_details, dealer_slot: "2"}},
+    {...snapshot, table_details: {...snapshot.table_details, blind_slot: 1}},
   ]) assert.equal(publicSnapshot(value, 18), null);
   assert.equal(publicSnapshot(snapshot, -1), null);
   assert.equal(publicSnapshot(snapshot, Number.MAX_SAFE_INTEGER + 1), null);
