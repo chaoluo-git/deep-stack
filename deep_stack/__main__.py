@@ -85,8 +85,13 @@ def _parser():
     h5.add_argument("--patterns", action="store_true", help="检测可能的周期性往返消息")
     _add_output(h5)
 
+    packet_profile = commands.add_parser("h5-profile", help="对本机抓包做二进制封包结构统计")
+    packet_profile.add_argument("trace", type=Path, metavar="TRACE", help="Chrome HAR 或 CDP JSON 事件列表")
+    _add_output(packet_profile)
+
     h5_live = commands.add_parser("h5-live", help="接收 Chrome 扩展的实时 WebSocket 消息摘要")
     _add_h5_listener(h5_live, 8767)
+    h5_live.add_argument("--journal", type=Path, metavar="JOURNAL", help="新建网络帧元数据 JSONL 时间轴")
 
     calibration = commands.add_parser("h5-calibrate", help="在同一时间轴上采集 H5 帧和可见牌局动作")
     calibration.add_argument("timeline", type=Path, metavar="TIMELINE", help="创建新的匿名校准 JSONL 文件")
@@ -258,16 +263,30 @@ def _h5_pairing_file(path):
 
 
 def _run_h5_live(args):
-    from .h5_live import serve_live
+    from .h5_live import live_server, serve_live
     from .h5_traffic import TrafficAnalyzer
 
     traffic = TrafficAnalyzer()
+    journal_path = args.journal.expanduser() if args.journal is not None else None
+    journal = None
+    journal_failure = None
 
     def emit(event):
+        nonlocal journal_failure
+        if journal is not None and event["type"] == "frames":
+            try:
+                journal.h5(event)
+            except (OSError, ValueError) as error:
+                journal_failure = error
+                raise
+        if journal_path is not None and event["type"] == "listening":
+            event = {**event, "journal": str(journal_path)}
         if args.json:
             print(json.dumps(event, ensure_ascii=False, allow_nan=False), flush=True)
         elif event["type"] == "listening":
             print(f"H5 本机监听 {event['url']}\n配对文件 {event['pairing_file']}", flush=True)
+            if journal_path is not None:
+                print(f"网络帧时间轴 {journal_path}", flush=True)
         elif event["type"] == "frames":
             for frame in event["frames"]:
                 direction = "下行" if frame["direction"] == "received" else "上行"
@@ -280,7 +299,16 @@ def _run_h5_live(args):
                 print(pattern["message"], flush=True)
 
     with _h5_pairing_file(args.pair_file) as pairing:
-        return serve_live(args.port, pairing, emit)
+        if journal_path is None:
+            return serve_live(args.port, pairing, emit)
+        from .h5_calibration import CalibrationRecorder
+
+        if journal_path.resolve() == pairing.resolve():
+            raise ValueError("网络帧时间轴与配对文件需要不同路径")
+        with CalibrationRecorder(journal_path) as journal, live_server(args.port, pairing, emit) as server:
+            while journal_failure is None:
+                server.handle_request()
+            raise journal_failure
 
 
 def _run_h5_calibrate(args):
@@ -351,6 +379,15 @@ def _run_h5_calibrate(args):
 def _run(args):
     if args.command == "h5-live":
         return _run_h5_live(args)
+    if args.command == "h5-profile":
+        from .h5_packet_profile import profile_packets
+
+        trace = args.trace.expanduser()
+        if args.output is not None:
+            args.output = args.output.expanduser()
+            if args.output.resolve() == trace.resolve():
+                raise ValueError("H5 封包报告需要与原始抓包使用不同文件")
+        return profile_packets(trace)
     if args.command == "h5-calibrate":
         return _run_h5_calibrate(args)
     if args.command == "h5-correlate":

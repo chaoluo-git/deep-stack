@@ -30,7 +30,7 @@ python3 -m deep_stack h5-inspect "$HOME/Downloads/h5-wpk.har" -o "$HOME/Download
 
 ```bash
 deep-stack h5-live
-deep-stack h5-live --port 0 --json
+deep-stack h5-live --port 0 --journal network-session.jsonl --json
 ```
 
 Chrome 118 或以上可在 `chrome://extensions` 加载未打包的扩展，源码目录为 `extensions/wpk-h5-capture`，独立包内为 `wpk-h5-capture`。关闭同一 WPK 标签页已打开的 DevTools，在 `https://h5.wpk.com` 标签页打开扩展，选择终端显示的配对文件，点击「开始采集」。系统文件选择器如果关掉了小弹窗，可以用「在独立窗口配对」。采集时 Chrome 会显示调试提示。扩展的「停止采集」、关闭目标标签页或离开 WPK 会结束采集。接收程序重启后使用新生成的配对文件。[Chrome Debugger API](https://developer.chrome.com/docs/extensions/reference/api/debugger)
@@ -38,16 +38,15 @@ Chrome 118 或以上可在 `chrome://extensions` 加载未打包的扩展，源�
 接收程序只监听 `127.0.0.1`。扩展在本地生成帧的时间、方向、操作码、字节数与编码标签，HTTP 批次只带这些元数据和匿名标识。配对令牌由本地文件提供，监听停止后配对失效。终端会把满足周期和延迟条件的往返标为「可能是保活或轮询」。可用 `h5-inspect --patterns` 对已导出的文件做同样的检测。牌局事件仍需要可验证的字段映射后才能进入 EV 分析。[CDP WebSocket 帧定义](https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-WebSocketFrame)
 
 
-### 同时记录 H5 帧和可见动作
+### 本机二进制封包分析
 
-观战时启动双源校准，再按上一节在 Chrome 扩展中选择这一轮的配对文件并点击「开始」。每次采集使用新的 JSONL 文件。结束前先停止扩展，也可用 `Ctrl+C` 停止程序。8 座和 9 座默认自动识别，需要手动标定时可用 `--table-seats 8` 或 `--table-seats 9`。有多张牌桌时，macOS 可以用 `--window-id ID` 固定目标。
+`--journal` 为本次监听创建新的网络帧时间轴，记录浏览器的帧相对时间和本机批次到达时间。对已有 HAR 或 CDP 捕获，可在本机检查字节结构。
 
 ```bash
-deep-stack h5-calibrate table-trial.jsonl --spectate --seconds 120
-deep-stack h5-correlate table-trial.jsonl --window-ms 1500 -o table-trial-correlation.json
+deep-stack h5-profile "$HOME/Downloads/h5-wpk.har" -o packet-profile.json
 ```
 
-时间轴保留 WSS 帧的元数据和浏览器相对时间、批次在本机的接收时间，以及可见座位动作和公共牌的截图采样时刻。报告为每个画面标记统计可能相关的帧数。时间相邻仅提供核验线索。需要关联稳定玩家 ID 时，可显式指定 `--db players.sqlite3 --session table-01` 启用独立的本机玩家记录，校准文件仍只保留座位和匿名手牌标识。生产字段、Hand2Note 的可用范围及验收条件见[动作采集规范](docs/h5-action-collection.md)。
+报告按匿名连接和方向统计包长、头尾重复程度、字节熵和候选长度字段。该命令读取 HAR 或 CDP 捕获中的二进制消息，网络时间轴只有帧元数据，适合实时监测和按时间核对。生产动作以已验证的消息字段为准，观战画面或已获准使用的牌谱可供人工标注和核对。实况证据、Hand2Note 的可用范围及验收条件见[动作采集规范](docs/h5-action-collection.md)。
 
 ## 安装与启动
 

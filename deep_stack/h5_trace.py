@@ -33,6 +33,14 @@ class _Frame:
     encoding: str
 
 
+@dataclass(frozen=True)
+class BinaryPacket:
+    stream: tuple
+    timestamp: float
+    direction: str
+    body: bytes
+
+
 def _reject_constant(_value):
     raise ValueError("JSON 只能使用有限数值")
 
@@ -91,24 +99,28 @@ def _contains_json(payload):
         return False
 
 
-def _frame(stream, timestamp, direction, opcode, payload):
+def _decode_payload(opcode, payload):
     if type(opcode) is not int or not 0 <= opcode <= 15:
         raise ValueError("WebSocket 消息操作码无效")
     if not isinstance(payload, str):
         raise ValueError("WebSocket 消息缺少有效的字符串负载")
-
     if opcode == 1:
         try:
-            size = len(payload.encode("utf-8"))
+            return payload.encode("utf-8")
         except UnicodeError:
             raise ValueError("WebSocket 文本负载不是有效的 UTF-8") from None
+    try:
+        return b64decode(payload, validate=True)
+    except ValueError:
+        raise ValueError("WebSocket 二进制消息的 Base64 编码无效") from None
+
+
+def _frame(stream, timestamp, direction, opcode, payload):
+    decoded = _decode_payload(opcode, payload)
+    size = len(decoded)
+    if opcode == 1:
         encoding = "json" if _contains_json(payload) else "utf8"
     else:
-        try:
-            decoded = b64decode(payload, validate=True)
-        except ValueError:
-            raise ValueError("WebSocket 二进制消息的 Base64 编码无效") from None
-        size = len(decoded)
         if opcode >= 8:
             encoding = "control"
         elif size >= 10 and decoded.startswith(b"\x1f\x8b\x08") and not decoded[3] & 0xe0:
@@ -121,7 +133,15 @@ def _frame(stream, timestamp, direction, opcode, payload):
     return _Frame(stream, _time(timestamp), direction, opcode, size, encoding)
 
 
-def _har_frames(document):
+def _read_binary_packet(stream, timestamp, direction, opcode, payload):
+    timestamp = _time(timestamp)
+    decoded = _decode_payload(opcode, payload)
+    if opcode == 2:
+        return BinaryPacket(stream, timestamp, direction, decoded)
+    return None
+
+
+def _har_frames(document, decode):
     log = document.get("log")
     if not isinstance(log, dict) or not isinstance(log.get("entries"), list):
         raise ValueError("HAR 缺少 log.entries 列表")
@@ -145,13 +165,13 @@ def _har_frames(document):
                 continue
             if direction not in _HAR_DIRECTIONS:
                 raise ValueError("HAR WebSocket 消息方向无效")
-            yield _frame(
+            yield decode(
                 (stream,), message.get("time"), _HAR_DIRECTIONS[direction],
                 message.get("opcode"), message.get("data"),
             )
 
 
-def _cdp_frames(entries):
+def _cdp_frames(entries, decode):
     if not isinstance(entries, list):
         raise ValueError("CDP 捕获需要 JSON 事件列表")
     for entry in entries:
@@ -182,10 +202,32 @@ def _cdp_frames(entries):
         response = params.get("response")
         if not isinstance(response, dict):
             raise ValueError("CDP WebSocket 事件缺少消息内容")
-        yield _frame(
+        yield decode(
             (*context, request_id), params.get("timestamp"), _CDP_DIRECTIONS[method],
             response.get("opcode"), response.get("payloadData"),
         )
+
+
+def _trace_records(path, decode):
+    document = _read_document(path)
+    if isinstance(document, dict) and "log" in document:
+        return "chrome_har", _har_frames(document, decode)
+    if isinstance(document, list) or isinstance(document, dict) and "events" in document:
+        return "cdp_json", _cdp_frames(document if isinstance(document, list) else document["events"], decode)
+    raise ValueError("捕获文件须为 Chrome HAR 或 CDP JSON 事件列表")
+
+
+def _bounded_records(records):
+    for count, record in enumerate(records, start=1):
+        if count > _MAX_MESSAGES:
+            raise ValueError("捕获文件含超过 100000 条 WebSocket 消息或错误")
+        yield record
+
+
+def read_binary_packets(path):
+    """Read opcode-2 packet bodies for local analysis without serializing payloads."""
+    _, records = _trace_records(path, _read_binary_packet)
+    yield from (packet for packet in _bounded_records(records) if packet is not None)
 
 
 def inspect_trace(path):
@@ -195,20 +237,10 @@ def inspect_trace(path):
     are counted separately. Payload tags are observations about encoding
     only and do not identify the application's message schema.
     """
-    document = _read_document(path)
-    if isinstance(document, dict) and "log" in document:
-        source_format, records = "chrome_har", _har_frames(document)
-    elif isinstance(document, list) or isinstance(document, dict) and "events" in document:
-        source_format = "cdp_json"
-        records = _cdp_frames(document if isinstance(document, list) else document["events"])
-    else:
-        raise ValueError("捕获文件须为 Chrome HAR 或 CDP JSON 事件列表")
-
+    source_format, records = _trace_records(path, _frame)
     frames = []
     errors = 0
-    for count, record in enumerate(records, start=1):
-        if count > _MAX_MESSAGES:
-            raise ValueError("捕获文件含超过 100000 条 WebSocket 消息或错误")
+    for record in _bounded_records(records):
         if record is None:
             errors += 1
         else:

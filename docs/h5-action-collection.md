@@ -1,50 +1,50 @@
 # WPK H5 牌局动作采集生产规范
 
-目标是持续记录当前 WPK 牌桌上已经公开显示的动作，回答哪一桌、哪一手、哪个位置的玩家在何时做了什么，以及能确认的筹码变化。记录应可回查来源，可发现漏采，并能在桌况和金额足够明确时交给 EV 分析。首批验收覆盖 8 座和 9 座标准无限注德州扑克的观战与入座场景。
+目标是从 WPK H5 网络消息持续记录当前牌桌上已经公开的动作，回答哪一桌、哪一手、哪个位置的玩家在何时做了什么，以及能确认的筹码变化。实时动作须来自已验证的包内业务字段。画面用于人工复核和标注样本。记录应可回查来源，可发现漏采，并能在桌况和金额足够明确时交给 EV 分析。首批验收覆盖 8 座和 9 座标准无限注德州扑克的观战与入座场景。
 
 ## 当前证据和数据来源
 
-已有 HAR 包含 4 条连接的 3,327 条二进制消息，另一次浏览器实时采集收到 87 条帧元数据。现有证据支持识别约 5 秒的周期性往返。公开牌出现前后也有短突发，类似突发在其他时间重复出现。公开资料尚缺 WPK 动作消息规格、字段口径和授权的实时数据接口。 [WePoker 官网](https://www.wpk.life/) · [Chrome CDP WebSocket 帧定义](https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-WebSocketFrame)
+已有 HAR 包含 4 条连接的 3,327 条二进制消息。另一次纯网络实测在约 131 秒内写入 198 条二进制帧，172 条下行、26 条上行。扩展报告零丢弃，接收端正常清理配对文件。两轮都有约 5 秒的周期性往返。公开牌出现前后也有短突发，类似突发在其他时间重复出现。逐连接与方向检查时，头尾各 4 字节未出现重复，受检长度前缀候选为 0。独立探索把每条连接按时间划分为前半和留出集，起始位置的标准 Protobuf 线格式仅在前半 1,663 帧中偶合 2 次，在留出 1,664 帧中偶合 0 次。510 种受检 TLV 布局中，前半命中最多的一种在留出集中仅命中 9 次。是否存在加密或其他封装仍待证实，公开资料尚缺 WPK 动作消息规格和字段口径。 [WePoker 官网](https://www.wpk.com/) · [Chrome CDP WebSocket 帧定义](https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-WebSocketFrame)
 
 | 来源 | 当前用途 |
 | --- | --- |
 | 当前 Chrome WPK 标签页的 WebSocket 摘要 | 记录匿名连接号、相对时间、方向、操作码、字节数、编码特征及本机批次到达时间。用于连接健康、周期识别和时序校准。 |
-| 同桌画面 OCR 和手工核对 | 记录公开可见的座位、动作标签、街次、金额和公共牌。画面遮挡或证据冲突时保留缺项。 |
+| 同桌画面人工标注 | 为已公开可见的座位、动作、街次、金额和公共牌提供独立对照。画面遮挡或证据冲突时保留缺项。 |
 | 厂商授权接口、文档化的公开事件或官方牌谱 | 获得相应文档和样本后验证字段。牌谱可作结算核对或离线金标，实时来源须单独验证。 |
 
 写入动作库前须有明确的数据来源和验证记录。负载、令牌、Cookie、带查询参数的地址、对手未公开的底牌以及从消息长度推断的玩家和动作均排除在采集结果之外。原始 HAR 仅供本机受控检查，清理版导出也可能包含完整消息数据。 [Chromium HAR 导出实现](https://github.com/ChromeDevTools/devtools-frontend/blob/main/front_end/models/har/Log.ts)
 
-## 同步采集与时序校准
+## 实时包采集、封包分析和核对
 
-当前实现提供两个命令。使用本机的新 JSONL 文件作为 `TIMELINE`，另选文件保存报告。
+`h5-live` 实时写入网络帧元数据，`h5-profile` 对本机导出的 HAR 或 CDP 捕获做二进制结构检查。
 
 ```bash
-deep-stack h5-calibrate TIMELINE
-deep-stack h5-correlate TIMELINE -o REPORT
+deep-stack h5-live --port 0 --journal network-session.jsonl --json
+deep-stack h5-profile capture.har -o packet-profile.json
 ```
 
-1. 启动 `h5-calibrate`，在 WPK 标签页打开现有 Chrome 扩展，选择终端显示的配对文件并开始采集。保持目标牌桌完整可见。观战可加 `--spectate`，锁定实体座位数可用 `--table-seats 8` 或 `--table-seats 9`。默认按 0.75 秒间隔采样，可用 `--interval` 调整，用 `--seconds` 限定时长，或按 `Ctrl+C` 停止。
-2. 时间线写入 `h5_batch`、`screen_action` 和 `screen_board`。`arrival_ms` 是本机接收批次的时刻，`sample_started_ms` 和 `at_ms` 分别记录截屏开始与完成，单位均为相对于这一条时间线的毫秒。旧记录没有 `sample_started_ms` 时按 `at_ms` 处理。帧的 `offset_ms` 以每次浏览器采集的首个 CDP 帧为零，自己的时钟基准独立于本机时间线。画面记录保留公开街次、座位、动作、可见金额和公共牌，手牌标识在文件内匿名化。
-3. `h5-correlate` 按批次到达时间找候选。默认取截屏开始前至结束后的各 1,500 毫秒，可用 `--window-ms` 调整。报告按动作和公共牌标记分别统计零个、单个和多个候选，记录候选批数、帧数和省略数量，也统计重复批与被忽略的残缺尾行。浏览器相对偏移供查看排序和条件上界，实际帧时刻的下界未知。单个候选只表示该窗口内有一帧，业务映射仍待验证。 [Chrome CDP 时间字段](https://chromedevtools.github.io/devtools-protocol/tot/Network/#event-webSocketWillSendHandshakeRequest)
+1. 在 WPK 标签页打开已安装的 Chrome 扩展，选择终端显示的配对文件并开始采集。时间轴保存 `h5_batch`。`arrival_ms` 是本机接收批次的时刻，`offset_ms` 以每次 Chrome 采集的首个可见 CDP 帧为零，两者使用独立时钟基准。浏览器停止后按 `Ctrl+C` 关闭本机接收端。停止原因和丢弃计数可在扩展查看。 [Chrome CDP 时间字段](https://chromedevtools.github.io/devtools-protocol/tot/Network/#event-webSocketFrameReceived)
+2. 封包报告按连接和方向归纳包长与头尾分布，扫描有限范围内的 1、2、4 字节长度前缀。报告列出候选支持数和覆盖率，适用于筛选值得验证的结构。原始消息只在本机处理，派生报告保存统计量。
+3. 独立记录实际观战画面中的座位、街次、动作和金额，或取得已获准使用的完整牌谱。按时序提出字段假设，用不同手牌和独立会话复测。对已有双源校准文件可用 `h5-correlate TIMELINE -o REPORT` 统计样本前后的候选帧数量。单个候选只表示时间范围内有一帧，业务映射仍待独立验证。
 
-当前时间线支持本机匿名校准及离线复核。跨会话时钟对齐、丢弃间隔标记、协议动作持久化和自动对账属于后续生产能力。停止原因和丢弃计数可在扩展查看。
+当前网络时间线支持本机匿名校准及离线复核。跨会话时钟对齐、丢弃间隔标记、协议动作持久化和自动对账属于后续生产能力。
 
 ## Hand2Note 兼容性和牌谱对账
 
 Hand2Note 4 的当前官方 Android 支持表列出 WePoker，注明 Windows 上的 LDPlayer 9 模拟器路线，Windows 桌面应用 HUD 列未勾选。该表还分别列出 PokerBros、PPPoker 等应用。经核对当前官方桌面表及说明，Chrome 中的 `h5.wpk.com` 仍没有可验证的 HUD、牌谱读取或实时动作接口支持记录。WPN 指 Winning Poker Network，官方教程适用于 ACR Poker、Black Chip Poker 等该网络房间。 [Hand2Note 4 支持说明](https://hand2note.com/Help/supported-sites) · [官方 Android 支持表](https://docs.google.com/spreadsheets/d/e/2PACX-1vSfUG8DRkQmc7objIMXjfYqCbDAJWbJZsgJtWtLdL74g7WCHRF3C_eA_EeeHyvonQeOXLd5PUO5GCgi/pubhtml?gid=68794297&single=true) · [WPN 教程](https://hand2note.com/Help/PokerSites/wpn-hud)
 
-Hand2Note 3 的官方亚洲页面也曾列出 WePoker、PokerMaster、PokerKing、RedDragon 和 PP/KK Poker，说明的是旧版 Android 模拟器和 ASIA 订阅。Hand2Note 4 提供从文件、文件夹及部分追踪器数据库导入，对房间原生格式有依赖。已导入的手牌可通过官方导出功能保存为文本。 [旧版亚洲应用列表](https://hand2note3.hand2note.com/PokerMaster) · [Hand2Note 4 导入指南](https://hand2note.com/Help/getting-started) · [文本导出指南](https://hand2note.com/Help/Features/marked-hands)
+Hand2Note 3 的官方亚洲页面也曾列出 WePoker、PokerMaster、PokerKing、RedDragon 和 PP/KK Poker，说明的是旧版 Android 模拟器和 ASIA 订阅。该页面也列有观战牌谱采集功能，未逐个房间确认。Hand2Note 4 提供从文件、文件夹及部分追踪器数据库导入，对房间原生格式有依赖。已导入的手牌可通过官方导出功能保存为文本。 [旧版亚洲应用列表](https://hand2note3.hand2note.com/PokerMaster) · [Hand2Note 4 导入指南](https://hand2note.com/Help/getting-started) · [文本导出指南](https://hand2note.com/Help/Features/marked-hands)
 
-后续可从授权的 WPK 牌谱或受支持客户端中导出的、已获准使用的 Hand2Note 牌谱取得样本。保留房间、客户端版本和原生格式。在本机用少量已完成手牌核对桌、手、座位、动作顺序、下注口径与结算。确认同一手牌标识及金额一致后，用牌谱为屏幕记录补证，并区分画面读数与牌谱字段。导入适配以真实样本和格式确认作为开工条件。Hand2Note 的 Alias 按房间和用户名管理别名。只有核对属于同一人时才合并个人统计，CSV 可用于迁移别名。 [Hand2Note Alias 指南](https://hand2note.com/Help/Features/aliases)
+后续可从授权的 WPK 牌谱或受支持客户端中导出的、已获准使用的 Hand2Note 牌谱取得样本。保留房间、客户端版本和原生格式。在本机用少量已完成手牌核对桌、手、座位、动作顺序、下注口径与结算。确认同一手牌标识及金额一致后，用牌谱核对网络解析结果，并保存各字段的证据来源。导入适配以真实样本和格式确认作为开工条件。Hand2Note 的 Alias 按房间和用户名管理别名。只有核对属于同一人时才合并个人统计，CSV 可用于迁移别名。 [Hand2Note Alias 指南](https://hand2note.com/Help/Features/aliases)
 
 ## 正式动作事件合同
 
-以下是后续生产记录的合同。当前校准文件采用独立的精简字段。截图先产生观察事件，经过授权的数据源或人工核对可提升对应字段的证据等级。
+以下是后续生产记录的合同。当前校准文件采用独立的精简字段。动作由已验证的网络字段产生，画面和赛后牌谱可为对应字段提供独立验证。
 
 | 字段组 | 约定 |
 | --- | --- |
-| 合同与来源 | `schema_version`、`source.kind`、`source.version`、`source.ref`。来源类型区分画面、人工核对、厂商授权事件和官方牌谱。引用只带本机匿名标识与必要的行号或采样号。 |
-| 范围与顺序 | `session_id`、`table_id`、`hand_id`、`event_id`、`sequence`、`street`。保存授权来源定义的作用域和顺序。画面生成的桌、手、事件标识作用域为本机观察会话，顺序为观察次序。 |
+| 合同与来源 | `schema_version`、`source.kind`、`source.version`、`source.ref`。生产动作记录可核验的网络来源和解析版本，人工标注与官方牌谱作为独立证据引用。引用只带本机匿名标识与必要的行号或采样号。 |
+| 范围与顺序 | `session_id`、`table_id`、`hand_id`、`event_id`、`sequence`、`street`。保存来源定义的作用域与顺序，以及标注的本机观察次序。 |
 | 动作和身份 | `kind` 规范为 `fold`、`check`、`call`、`bet`、`raise`、`all_in`。另记录 `seat`、`binding_revision`，以及允许保存且证据充分时的 `player_ref`。物理座位与本手位置分别保存。座位绑定覆盖的手牌范围须明确，换座或冲突后重新核对。 |
 | 时间与完整性 | `observed_at_ms` 或采集区间、`time_basis`、`integrity`。对每项关键字段记录 `observed`、`verified` 或 `unknown`，并保留证据引用。未确认字段用 `null`。 |
 | 筹码 | 以来源约定的单位分别记录 `amount_paid`（本次追加）、`raise_to`（加注到）、`street_total`（本街累计）、`stack_after` 和 `pot_total`。金额确定为零时写入 0，并注明动作规则或来源。盲注、ante、退款和边池等分项独立记录并用于对账。 |
@@ -57,7 +57,7 @@ Hand2Note 3 的官方亚洲页面也曾列出 WePoker、PokerMaster、PokerKing�
 
 | 阶段 | 验收结果 |
 | --- | --- |
-| 同步记录 | 实际 Chrome 扩展与牌桌观察连续运行，文件可回放。跨来源时间不确定的样本和停止原因可解释。 |
+| 同步记录 | 实际 Chrome 扩展与本机网络接收端连续运行，文件可回放。跨来源核对说明时间误差范围，停止原因可查。 |
 | 字段验证 | 用同桌的已标注公开动作或获准牌谱逐项核对座位、街次、动作和金额口径。只对已验证的字段建立版本化映射。 |
 | 发布门槛 | 用未参与标定的真实样本复测准确率、漏报、时延、重连、乱序和匿名输出，确认过期或证据不足时进入等待。 |
 

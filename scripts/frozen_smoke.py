@@ -202,11 +202,24 @@ def assert_h5_capture(executable, folder, env):
     if report["frame_count"] != 12 or len(patterns) != 1 or patterns[0]["period_ms"] != 5000:
         raise ValueError("Standalone H5 replay did not identify the synthetic exchange.")
 
+    profile = run_command(executable, folder, env, "h5-profile", trace)
+    packet_counts = {row["direction"]: (row["packet_count"], row["size_bytes"]["min"])
+                     for row in profile["directions"]}
+    if profile["binary_packet_count"] != 12 or packet_counts != {"sent": (6, 82), "received": (6, 62)}:
+        raise ValueError("Standalone H5 packet profile reported unexpected packet sizes or directions.")
+    if any(row["length_prefix"]["candidate_count"] for row in profile["directions"]):
+        raise ValueError("Standalone H5 packet profile inferred a prefix from packets of one size.")
+    profile_text = json.dumps(profile)
+    private_fields = ("payloadData", "synthetic-connection", frames[0]["params"]["response"]["payloadData"])
+    if any(field in profile_text for field in private_fields):
+        raise ValueError("Standalone H5 packet profile exposed input bytes or identifiers.")
+
     pairing_file = folder / "pairing.json"
+    journal = folder / "network-frames.jsonl"
     output = folder / "h5-live.jsonl"
     with output.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen([executable, "h5-live", "--port", "0", "--pair-file", pairing_file, "--json"],
-                                   cwd=folder, env=env, stdout=log)
+        process = subprocess.Popen([executable, "h5-live", "--port", "0", "--pair-file", pairing_file,
+                                    "--journal", journal, "--json"], cwd=folder, env=env, stdout=log)
         try:
             deadline = monotonic() + 20
             while process.poll() is None and monotonic() < deadline:
@@ -228,6 +241,14 @@ def assert_h5_capture(executable, folder, env):
             events = [json.loads(line) for line in terminal.splitlines()]
             if (pairing["token"] in terminal or [event.get("frames") for event in events[1:]] != [[frame]]):
                 raise ValueError("Unexpected standalone H5 receiver output.")
+            journal_text = journal.read_text(encoding="utf-8")
+            start, recorded = map(json.loads, journal_text.splitlines())
+            arrival = recorded.pop("arrival_ms", None)
+            if (start != {"type": "calibration_start", "version": 1} or recorded != {"type": "h5_batch", **batch}
+                    or type(arrival) is not int or arrival < 0):
+                raise ValueError("Acknowledged H5 frame was missing or changed in the standalone network journal.")
+            if any(field in journal_text for field in (pairing["token"], "payloadData", "synthetic-connection")):
+                raise ValueError("Standalone network journal exposed a pairing credential or input field.")
         finally:
             process.terminate()
             try:
